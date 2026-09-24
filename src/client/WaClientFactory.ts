@@ -87,7 +87,10 @@ import { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import type { WaMediaConn } from '@media/types'
 import { createDefaultLinkPreviewFetcher } from '@message/addons/link-preview/fetcher'
 import { processNewsletterLiveUpdates } from '@message/kinds/newsletter'
-import { handleIncomingMessageAck } from '@message/primitives/incoming'
+import {
+    handleIncomingMessageAck,
+    type WaDeferredHistoryReceipt
+} from '@message/primitives/incoming'
 import {
     createMediaRetryRequester,
     type WaMediaRetryRequester
@@ -170,6 +173,10 @@ interface WaClientBuildRuntime {
     /** Whether anything is subscribed, for events whose payload costs something to build. */
     readonly hasEventListener: (event: keyof WaClientEventMap) => boolean
     readonly handleIncomingMessageEvent: (event: WaIncomingMessageEvent) => Promise<void>
+    readonly handleIncomingHistorySyncEvent?: (
+        event: WaIncomingMessageEvent,
+        receipt: WaDeferredHistoryReceipt
+    ) => boolean
     readonly handleError: (error: Error) => void
     readonly handleIncomingFrame: (frame: Uint8Array) => Promise<void>
     readonly clearStoredState: () => Promise<void>
@@ -265,8 +272,52 @@ function validateProxyOptions(options: WaClientOptions): void {
     assertProxyTransport(proxy?.mediaDownload, 'proxy.mediaDownload')
 }
 
+function validateHistoryBoundaryOptions(options: WaClientOptions): void {
+    const MAX_TIMER_DELAY_MS = 2_147_483_647
+    const history = options.history
+    const limits = history?.boundaryLimits
+    if (history?.onBatch) {
+        if (history.enabled === false) {
+            throw new Error('history.onBatch cannot be configured when history.enabled is false')
+        }
+        if (!limits) {
+            throw new Error(
+                'history.boundaryLimits are required when history.onBatch is configured'
+            )
+        }
+        const positive = (name: string, value: number): void => {
+            if (!Number.isSafeInteger(value) || value <= 0) {
+                throw new Error(`history.boundaryLimits.${name} must be a positive safe integer`)
+            }
+        }
+        positive('maxConcurrentBatches', limits.maxConcurrentBatches)
+        positive('maxBatchBytes', limits.maxBatchBytes)
+        positive('maxMessagesPerBatch', limits.maxMessagesPerBatch)
+        positive('maxSourceRecordsPerBatch', limits.maxSourceRecordsPerBatch)
+        positive('timeoutMs', limits.timeoutMs)
+        if (limits.timeoutMs > MAX_TIMER_DELAY_MS) {
+            throw new Error(
+                `history.boundaryLimits.timeoutMs must not exceed ${MAX_TIMER_DELAY_MS}`
+            )
+        }
+        if (!Number.isSafeInteger(limits.maxQueuedBatches) || limits.maxQueuedBatches < 0) {
+            throw new Error(
+                'history.boundaryLimits.maxQueuedBatches must be a non-negative safe integer'
+            )
+        }
+        if (!Number.isSafeInteger(limits.maxQueuedBytes) || limits.maxQueuedBytes < 0) {
+            throw new Error(
+                'history.boundaryLimits.maxQueuedBytes must be a non-negative safe integer'
+            )
+        }
+    } else if (limits) {
+        throw new Error('history.boundaryLimits require history.onBatch')
+    }
+}
+
 export function resolveWaClientBase(options: WaClientOptions, logger: Logger): WaClientBase {
     validateProxyOptions(options)
+    validateHistoryBoundaryOptions(options)
 
     const device = resolveWaDeviceIdentity(options)
     const sessionId = options.sessionId.trim()
@@ -1058,6 +1109,7 @@ export function buildWaClientDependencies(input: {
     const incomingMessageAckOptions: Parameters<typeof handleIncomingMessageAck>[1] = {
         logger,
         sendNode: runtime.sendNode,
+        captureBoundSendNode: () => nodeTransport.captureBoundSender(),
         getMeJid: () => getCurrentCredentials()?.meJid,
         getMeLid: () => getCurrentCredentials()?.meLid,
         signalProtocol,
@@ -1071,6 +1123,14 @@ export function buildWaClientDependencies(input: {
                 .handleIncomingMessageEvent(event)
                 .catch((err) => runtime.handleError(toError(err)))
         },
+        ...(options.history?.onBatch
+            ? {
+                  scheduleHistorySync: (
+                      event: WaIncomingMessageEvent,
+                      receipt: WaDeferredHistoryReceipt
+                  ) => runtime.handleIncomingHistorySyncEvent?.(event, receipt) ?? false
+              }
+            : {}),
         emitNewsletterMessageUpdate: (event) =>
             runtime.emitEvent('newsletter_message_update', event),
         emitUnavailableMessage: (event) => runtime.emitEvent('message_unavailable', event),

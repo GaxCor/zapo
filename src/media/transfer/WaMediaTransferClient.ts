@@ -78,6 +78,7 @@ interface EncryptedDownloadRequest extends StreamDownloadRequest {
     readonly mediaKey: Uint8Array
     readonly fileSha256?: Uint8Array
     readonly fileEncSha256?: Uint8Array
+    readonly maxEncryptedBytes?: number
 }
 
 function normalizeHeaderRecord(
@@ -275,6 +276,12 @@ export class WaMediaTransferClient {
     public async downloadAndDecryptStream(
         request: EncryptedDownloadRequest
     ): Promise<WaMediaReadableDecryptionResult> {
+        if (
+            request.maxEncryptedBytes !== undefined &&
+            (!Number.isSafeInteger(request.maxEncryptedBytes) || request.maxEncryptedBytes < 0)
+        ) {
+            throw new Error('maxEncryptedBytes must be a non-negative safe integer')
+        }
         const response = await this.downloadStream(request)
         await this.assertSuccessfulResponse(response)
         const body = this.requireResponseBody(response)
@@ -283,6 +290,7 @@ export class WaMediaTransferClient {
             mediaKey: request.mediaKey,
             expectedFileSha256: request.fileSha256,
             expectedFileEncSha256: request.fileEncSha256,
+            maxEncryptedBytes: request.maxEncryptedBytes,
             skipMacVerification: this.skipMacVerification
         })
         decrypted.metadata.catch(() => undefined)

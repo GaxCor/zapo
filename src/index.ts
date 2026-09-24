@@ -7,7 +7,16 @@ export type {
     WaClientProxyOptions,
     WaDownloadMediaOptions,
     WaGroupHistoryBundleEvent,
+    WaHistorySyncBatchContext,
+    WaHistorySyncBatchHandler,
+    WaHistorySyncBatchV1,
     WaHistorySyncChunkEvent,
+    WaHistorySyncBoundaryLimits,
+    WaHistorySyncBoundaryFailureEvent,
+    WaHistorySyncChatKind,
+    WaHistorySyncFamilyDisposition,
+    WaHistorySyncMessageDisposition,
+    WaHistorySyncMessageObservation,
     WaHistorySyncOptions,
     WaWriteBehindOptions
 } from '@client/types'

@@ -37,6 +37,8 @@ import { longToNumber, parseOptionalInt, toError } from '@util/primitives'
 interface WaIncomingMessageAckHandlerOptions {
     readonly logger: Logger
     readonly sendNode: (node: BinaryNode) => Promise<void>
+    /** Captures the sender for the connection that delivered this stanza. */
+    readonly captureBoundSendNode?: () => (node: BinaryNode) => Promise<void>
     readonly getMeJid?: () => string | null | undefined
     readonly getMeLid?: () => string | null | undefined
     readonly signalProtocol?: SignalProtocol
@@ -51,10 +53,93 @@ interface WaIncomingMessageAckHandlerOptions {
      */
     readonly requestPlaceholderResend?: (context: WaRetryDecryptFailureContext) => boolean
     readonly emitIncomingMessage?: (event: WaIncomingMessageEvent) => void
+    /** Optional isolated history path. Returning false fails closed for this stanza. */
+    readonly scheduleHistorySync?: (
+        event: WaIncomingMessageEvent,
+        receipt: WaDeferredHistoryReceipt
+    ) => boolean
     readonly emitNewsletterMessageUpdate?: (event: WaIncomingNewsletterMessageUpdateEvent) => void
     readonly emitUnavailableMessage?: (event: WaIncomingUnavailableMessageEvent) => void
     readonly emitUnhandledStanza?: (event: WaIncomingUnhandledStanzaEvent) => void
     readonly emitDecryptedPayload?: (build: () => WaIncomingDecryptedPayloadEvent) => void
+}
+
+export interface WaDeferredHistoryReceipt {
+    /** Marks this history batch durably accepted; the ordinary receipt waits for every batch. */
+    complete(): void
+    /** Permanently suppresses the ordinary receipt for the containing stanza. */
+    fail(): void
+    /** Sends the distinct `hist_sync` protocol receipt on the original connection. */
+    sendHistorySyncReceipt(): Promise<void>
+}
+
+class DeferredHistoryReceiptGate {
+    private readonly sendNode: (node: BinaryNode) => Promise<void>
+    private readonly deliveryReceipt: BinaryNode
+    private readonly logger: Logger
+    private pending = 0
+    private sealed = false
+    private failed = false
+    private sent = false
+
+    public constructor(
+        sendNode: (node: BinaryNode) => Promise<void>,
+        deliveryReceipt: BinaryNode,
+        logger: Logger
+    ) {
+        this.sendNode = sendNode
+        this.deliveryReceipt = deliveryReceipt
+        this.logger = logger
+    }
+
+    public register(): WaDeferredHistoryReceipt {
+        this.pending += 1
+        let settled = false
+        let failed = false
+        let historyReceiptSent = false
+        return {
+            complete: () => {
+                if (settled) return
+                settled = true
+                this.pending -= 1
+                this.maybeSend()
+            },
+            fail: () => {
+                if (settled) return
+                settled = true
+                failed = true
+                this.failed = true
+                this.pending -= 1
+            },
+            sendHistorySyncReceipt: async () => {
+                if (historyReceiptSent || failed || this.failed || !settled) return
+                historyReceiptSent = true
+                await this.sendNode({
+                    tag: WA_MESSAGE_TAGS.RECEIPT,
+                    attrs: {
+                        id: this.deliveryReceipt.attrs.id,
+                        to: this.deliveryReceipt.attrs.to,
+                        type: WA_MESSAGE_TYPES.RECEIPT_TYPE_HISTORY_SYNC
+                    }
+                })
+            }
+        }
+    }
+
+    public seal(): void {
+        this.sealed = true
+        this.maybeSend()
+    }
+
+    private maybeSend(): void {
+        if (!this.sealed || this.pending !== 0 || this.failed || this.sent) {
+            return
+        }
+        this.sent = true
+        void this.sendNode(this.deliveryReceipt).catch(() => {
+            this.logger.warn('failed to send deferred history delivery receipt')
+        })
+    }
 }
 
 interface MessageIdentityAttrs {
@@ -91,6 +176,15 @@ function extractMessageIdentityAttrs(attrs: BinaryNode['attrs']): MessageIdentit
         ...(recipientUsername !== undefined ? { recipientUsername } : {}),
         pushName: attrs.notify
     }
+}
+
+function isHistorySyncNotificationEvent(event: WaIncomingMessageEvent): boolean {
+    const protocolMessage = event.message?.protocolMessage
+    return (
+        protocolMessage?.type === proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION &&
+        protocolMessage.historySyncNotification !== null &&
+        protocolMessage.historySyncNotification !== undefined
+    )
 }
 
 type MessageKeyIdentity = Omit<MessageIdentityAttrs, 'pushName'>
@@ -609,12 +703,31 @@ export async function handleIncomingMessageAck(
         return false
     }
 
+    const stanzaOptions = options
+    const sendDeferredHistoryNode =
+        options.scheduleHistorySync && options.captureBoundSendNode
+            ? options.captureBoundSendNode()
+            : options.sendNode
+
     const from = node.attrs.from
     if (from && isNewsletterJid(from)) {
-        return handleIncomingNewsletterMessage(node, options)
+        return handleIncomingNewsletterMessage(node, stanzaOptions)
     }
 
     let shouldSendStandardReceipt = true
+    const deferredHistoryEvents: WaIncomingMessageEvent[] = []
+    const decryptOptions = stanzaOptions.scheduleHistorySync
+        ? {
+              ...stanzaOptions,
+              emitIncomingMessage: (event: WaIncomingMessageEvent): void => {
+                  if (isHistorySyncNotificationEvent(event)) {
+                      deferredHistoryEvents.push(event)
+                  } else {
+                      stanzaOptions.emitIncomingMessage?.(event)
+                  }
+              }
+          }
+        : stanzaOptions
     const nodeContent = node.content
     if (Array.isArray(nodeContent) && nodeContent.length > 0) {
         const senderJid = node.attrs.participant ?? node.attrs.from
@@ -652,7 +765,7 @@ export async function handleIncomingMessageAck(
                         'skmsg',
                         encCount - 1,
                         senderJid,
-                        options,
+                        decryptOptions,
                         (ciphertext, senderAddress) =>
                             options.senderKeyManager!.decryptGroupMessage({
                                 groupId,
@@ -674,7 +787,7 @@ export async function handleIncomingMessageAck(
                         encType,
                         encCount - 1,
                         senderJid,
-                        options,
+                        decryptOptions,
                         (ciphertext, senderAddress) => {
                             const sessionJid = canonicalizeOwnAccountJid(
                                 senderJid,
@@ -699,7 +812,7 @@ export async function handleIncomingMessageAck(
                     // (encIv + encPayload), not a Signal envelope. The actual
                     // decryption uses the parent prompt's messageSecret and is
                     // performed downstream by `tryDecryptBotChunk`.
-                    result = processMsmsgEncNode(node, child, senderJid, options)
+                    result = processMsmsgEncNode(node, child, senderJid, decryptOptions)
                     break
                 }
                 default:
@@ -720,7 +833,7 @@ export async function handleIncomingMessageAck(
         if (encCount > 0 && !hasSuccessfulDecrypt && firstDecryptFailure) {
             await sendRetryReceiptForDecryptFailure(
                 node,
-                options,
+                stanzaOptions,
                 firstDecryptFailure.error,
                 firstDecryptFailure.encType
             )
@@ -730,11 +843,41 @@ export async function handleIncomingMessageAck(
 
     const id = node.attrs.id
     if (!id || !from) {
-        options.logger.warn('incoming message missing required attrs for ack/receipt', {
+        stanzaOptions.logger.warn('incoming message missing required attrs for ack/receipt', {
             hasId: Boolean(id),
             hasFrom: Boolean(from),
             type: node.attrs.type
         })
+        return true
+    }
+
+    if (deferredHistoryEvents.length > 0 && stanzaOptions.scheduleHistorySync) {
+        if (!shouldSendStandardReceipt) {
+            return true
+        }
+        const deliveryReceipt = buildReceiptNode({
+            kind: 'delivery',
+            node,
+            id,
+            to: from
+        })
+        const gate = new DeferredHistoryReceiptGate(
+            sendDeferredHistoryNode,
+            deliveryReceipt,
+            stanzaOptions.logger
+        )
+        for (const event of deferredHistoryEvents) {
+            const receipt = gate.register()
+            try {
+                if (!stanzaOptions.scheduleHistorySync(event, receipt)) {
+                    receipt.fail()
+                }
+            } catch {
+                receipt.fail()
+                stanzaOptions.logger.warn('failed to enqueue history boundary work')
+            }
+        }
+        gate.seal()
         return true
     }
 
@@ -744,15 +887,15 @@ export async function handleIncomingMessageAck(
             node,
             id,
             to: from,
-            from: options.getMeJid?.()
+            from: stanzaOptions.getMeJid?.()
         })
-        options.logger.trace('sending inbound message ack', {
+        stanzaOptions.logger.trace('sending inbound message ack', {
             id,
             to: from,
             type: ackNode.attrs.type,
             participant: ackNode.attrs.participant
         })
-        await options.sendNode(ackNode)
+        await stanzaOptions.sendNode(ackNode)
         return true
     }
 
@@ -770,10 +913,10 @@ export async function handleIncomingMessageAck(
         const { key, pushName } = buildIncomingMessageKey(
             node,
             sender ? { userJid: sender.userJid, device: sender.address.device } : null,
-            options
+            stanzaOptions
         )
         const resendRequested =
-            options.requestPlaceholderResend?.({
+            stanzaOptions.requestPlaceholderResend?.({
                 messageNode: node,
                 stanzaId: id,
                 from,
@@ -781,7 +924,7 @@ export async function handleIncomingMessageAck(
                 recipient: node.attrs.recipient,
                 t: node.attrs.t
             }) === true
-        options.emitUnavailableMessage?.({
+        stanzaOptions.emitUnavailableMessage?.({
             rawNode: buildIncomingEventRawNode(node),
             key,
             kind,
@@ -796,9 +939,9 @@ export async function handleIncomingMessageAck(
             node,
             id,
             to: from,
-            from: options.getMeJid?.()
+            from: stanzaOptions.getMeJid?.()
         })
-        options.logger.trace('acking unavailable incoming message', {
+        stanzaOptions.logger.trace('acking unavailable incoming message', {
             id,
             to: from,
             type: ackNode.attrs.type,
@@ -806,7 +949,7 @@ export async function handleIncomingMessageAck(
             unavailableKind: kind,
             resendRequested
         })
-        await options.sendNode(ackNode)
+        await stanzaOptions.sendNode(ackNode)
         return true
     }
 
@@ -820,13 +963,13 @@ export async function handleIncomingMessageAck(
         id,
         to: from
     })
-    options.logger.trace('sending inbound message receipt', {
+    stanzaOptions.logger.trace('sending inbound message receipt', {
         id,
         to: from,
         type: receiptNode.attrs.type,
         participant: receiptNode.attrs.participant
     })
-    await options.sendNode(receiptNode)
+    await stanzaOptions.sendNode(receiptNode)
     return true
 }
 

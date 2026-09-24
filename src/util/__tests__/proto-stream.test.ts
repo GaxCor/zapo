@@ -193,6 +193,13 @@ test('streamProtoFields rejects a materialized field above maxFieldBytes', async
     await assert.rejects(() => collect(SAMPLE, { maxFieldBytes: 8 }), /exceeds the 8 byte limit/)
 })
 
+test('streamProtoFields enforces the total input byte limit including descended fields', async () => {
+    await assert.rejects(
+        () => collect(SAMPLE, { maxTotalBytes: SAMPLE.byteLength - 1 }),
+        /stream exceeds the .* byte limit/
+    )
+})
+
 test('streamProtoFields exempts descended fields from maxFieldBytes', async () => {
     const events = await collect(SAMPLE, {
         maxFieldBytes: 64,

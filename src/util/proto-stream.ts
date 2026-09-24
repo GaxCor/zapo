@@ -53,6 +53,8 @@ export interface ProtoStreamOptions {
     readonly shouldDescend?: (fieldNumber: number, depth: number, byteLength: number) => boolean
     /** Cap on one materialized payload. Descended fields are exempt. Defaults to 32 MiB. */
     readonly maxFieldBytes?: number
+    /** Optional cap on all bytes read from the stream, including descended fields. */
+    readonly maxTotalBytes?: number
 }
 
 interface DescentFrame {
@@ -66,11 +68,14 @@ class ProtoStreamReader {
     private readPos = 0
     private writePos = 0
     private markPos = -1
+    private totalRead = 0
+    private readonly maxTotalBytes: number | undefined
     public consumed = 0
 
-    public constructor(source: Readable) {
+    public constructor(source: Readable, maxTotalBytes?: number) {
         this.iterator = source[Symbol.asyncIterator]() as AsyncIterator<unknown>
         this.buffer = new Uint8Array(PROTO_STREAM_INITIAL_BUFFER_BYTES)
+        this.maxTotalBytes = maxTotalBytes
     }
 
     public get buffered(): number {
@@ -100,6 +105,13 @@ class ProtoStreamReader {
             if (chunk.byteLength === 0) {
                 continue
             }
+            if (
+                this.maxTotalBytes !== undefined &&
+                this.totalRead + chunk.byteLength > this.maxTotalBytes
+            ) {
+                throw new Error(`protobuf stream exceeds the ${this.maxTotalBytes} byte limit`)
+            }
+            this.totalRead += chunk.byteLength
             this.reserve(chunk.byteLength)
             this.buffer.set(chunk, this.writePos)
             this.writePos += chunk.byteLength
@@ -241,8 +253,15 @@ export async function streamProtoFields(
     if (!Number.isSafeInteger(maxFieldBytes) || maxFieldBytes <= 0) {
         throw new Error(`invalid max field bytes limit: ${maxFieldBytes}`)
     }
+    const maxTotalBytes = options.maxTotalBytes
+    if (
+        maxTotalBytes !== undefined &&
+        (!Number.isSafeInteger(maxTotalBytes) || maxTotalBytes <= 0)
+    ) {
+        throw new Error(`invalid max total bytes limit: ${maxTotalBytes}`)
+    }
     const shouldDescend = options.shouldDescend
-    const reader = new ProtoStreamReader(source)
+    const reader = new ProtoStreamReader(source, maxTotalBytes)
     const stack: DescentFrame[] = []
     let value: Uint8Array = EMPTY_BYTES
     let varintValue = 0

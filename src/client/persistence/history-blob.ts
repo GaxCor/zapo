@@ -56,6 +56,11 @@ export interface WaHistoryBlobStream {
     readonly verified: Promise<unknown>
 }
 
+export interface WaHistoryBlobStreamOptions {
+    readonly signal?: AbortSignal
+    readonly maxEncryptedBytes?: number
+}
+
 /**
  * Streaming counterpart of {@link downloadHistoryBlob}, so a multi-megabyte chunk
  * is never held whole. Uses `inlinePayload` when the notification carried the
@@ -69,10 +74,17 @@ export async function openHistoryBlobStream(
     source: WaHistoryBlobSource,
     mediaType: MediaCryptoType,
     label: string,
-    inlinePayload?: Uint8Array | string | null
+    inlinePayload?: Uint8Array | string | null,
+    options: WaHistoryBlobStreamOptions = {}
 ): Promise<WaHistoryBlobStream> {
     if (inlinePayload) {
         const bytes = decodeProtoBytes(inlinePayload, `${label} inline payload`)
+        if (
+            options.maxEncryptedBytes !== undefined &&
+            bytes.byteLength > options.maxEncryptedBytes
+        ) {
+            throw new Error(`${label} inline payload exceeds the configured byte limit`)
+        }
         return inflateHistoryStream(Readable.from([bytes]), Promise.resolve(null))
     }
     if (!source.directPath) {
@@ -83,7 +95,9 @@ export async function openHistoryBlobStream(
         mediaType,
         mediaKey: decodeProtoBytes(source.mediaKey, `${label} mediaKey`),
         fileSha256: decodeProtoBytes(source.fileSha256, `${label} fileSha256`),
-        fileEncSha256: decodeProtoBytes(source.fileEncSha256, `${label} fileEncSha256`)
+        fileEncSha256: decodeProtoBytes(source.fileEncSha256, `${label} fileEncSha256`),
+        signal: options.signal,
+        maxEncryptedBytes: options.maxEncryptedBytes
     })
     return inflateHistoryStream(decrypted.plaintext, decrypted.metadata)
 }

@@ -36,6 +36,21 @@ export class WaNodeTransport extends EventEmitter {
         if (!comms) {
             throw new Error('comms is not connected')
         }
+        await this.sendNodeThrough(comms, node)
+    }
+
+    /** Captures the current comms so deferred protocol receipts cannot use a replacement connection. */
+    public captureBoundSender(): (node: BinaryNode) => Promise<void> {
+        const comms = this.comms
+        return async (node: BinaryNode): Promise<void> => {
+            if (!comms) {
+                throw new Error('comms was not connected when the sender was captured')
+            }
+            await this.sendNodeThrough(comms, node)
+        }
+    }
+
+    private async sendNodeThrough(comms: WaComms, node: BinaryNode): Promise<void> {
         this.logger.trace('node transport send node', {
             tag: node.tag,
             id: node.attrs.id,

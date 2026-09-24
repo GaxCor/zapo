@@ -165,7 +165,9 @@ export interface WaClientOptions extends WaAuthClientOptions, WaAuthSocketOption
      * `enabled: false` to drop them; `requireFullSync: true` asks the
      * primary device for a full history download instead of just recent;
      * `groupBundles: true` opts into the group-history bundle a member may
-     * share after somebody joins a group.
+     * share after somebody joins a group. The optional `onBatch` boundary
+     * replaces the shared-frame history path and requires explicit finite
+     * caller-selected limits; callback fulfillment gates ordinary delivery.
      */
     readonly history?: WaHistorySyncOptions
     /**
@@ -347,7 +349,99 @@ export interface WaHistorySyncOptions {
      * other members are dropped either way.
      */
     readonly groupBundles?: boolean
+    /**
+     * Durable-ingestion boundary callback. When configured, every supported
+     * history notification is decoded on an isolated bounded worker and its
+     * ordinary delivery receipt is withheld until this callback fulfills.
+     * Fulfillment must mean the complete batch has been durably accepted by
+     * the application. The callback does not control protocol receipts.
+     */
+    readonly onBatch?: WaHistorySyncBatchHandler
+    /** Required with `onBatch`; every value is caller-selected, finite, and has no library default. */
+    readonly boundaryLimits?: WaHistorySyncBoundaryLimits
 }
+
+export interface WaHistorySyncBoundaryLimits {
+    readonly maxConcurrentBatches: number
+    readonly maxQueuedBatches: number
+    readonly maxQueuedBytes: number
+    readonly maxBatchBytes: number
+    readonly maxMessagesPerBatch: number
+    readonly maxSourceRecordsPerBatch: number
+    readonly timeoutMs: number
+}
+
+export type WaHistorySyncChatKind = 'DIRECT' | 'GROUP' | 'BROADCAST' | 'NEWSLETTER' | 'UNKNOWN'
+
+export type WaHistorySyncMessageDisposition =
+    | 'IMPORT_DIRECT'
+    | 'EXCLUDED_GROUP'
+    | 'EXCLUDED_BROADCAST'
+    | 'EXCLUDED_NEWSLETTER'
+
+export interface WaHistorySyncMessageObservation {
+    readonly ordinal: number
+    readonly conversationOrdinal: number
+    readonly chatKind: WaHistorySyncChatKind
+    readonly disposition: WaHistorySyncMessageDisposition
+    readonly externalMessageId?: string
+    readonly conversationAddress?: string
+    readonly messageRemoteJid?: string
+    readonly fromMe?: boolean
+    readonly timestampSeconds?: string
+    readonly msgOrderId?: string
+    readonly messageStubType?: number
+    readonly content:
+        | { readonly kind: 'TEXT'; readonly text: string }
+        | { readonly kind: 'UNSUPPORTED'; readonly kindHint?: string }
+}
+
+export interface WaHistorySyncFamilyDisposition {
+    readonly scope: 'ROOT' | 'CONVERSATION' | 'HISTORY_SYNC_MESSAGE' | 'WEB_MESSAGE_INFO'
+    readonly fieldNumber: number
+    readonly disposition: 'MESSAGE_OBSERVATIONS' | 'METADATA_ONLY' | 'BLOCKED_UNDECIDED'
+    readonly count: number
+}
+
+/** A bounded protocol-observation batch; it is not a CRM or database model. */
+export interface WaHistorySyncBatchV1 {
+    readonly version: 1
+    readonly sourceHistoryCompleteness: 'UNKNOWN'
+    readonly notification: {
+        readonly syncType?: number
+        readonly chunkOrder?: number
+        readonly progress?: number
+        readonly originalMessageId?: string
+        readonly oldestMsgInChunkTimestampSec?: string
+    }
+    readonly decoded: {
+        readonly syncType?: number
+        readonly chunkOrder?: number
+        readonly progress?: number
+    }
+    readonly parseReachedEof: true
+    readonly payloadIntegrityVerified: true
+    readonly sourceFamilyDispositions: readonly WaHistorySyncFamilyDisposition[]
+    readonly metadataConflicts: readonly (
+        | 'notification_payload_chunk_order_mismatch'
+        | 'notification_payload_progress_mismatch'
+    )[]
+    readonly messageObservations: readonly WaHistorySyncMessageObservation[]
+}
+
+export interface WaHistorySyncBatchContext {
+    readonly signal: AbortSignal
+}
+
+/** Sanitized result when a durable-history boundary item cannot be accepted. */
+export interface WaHistorySyncBoundaryFailureEvent {
+    readonly reason: 'queue_full' | 'processing_failed' | 'timeout' | 'cancelled'
+}
+
+export type WaHistorySyncBatchHandler = (
+    batch: WaHistorySyncBatchV1,
+    context: WaHistorySyncBatchContext
+) => Promise<void>
 
 export interface WaSignalMessagePublishInput {
     readonly to: string
@@ -1575,6 +1669,8 @@ export interface WaClientEventMap {
      * Skipped only when `history.enabled` is explicitly `false`.
      */
     readonly history_sync_chunk: (event: WaHistorySyncChunkEvent) => void
+    /** Fail-closed durable-history boundary outcome; contains no source identifiers or payload. */
+    readonly history_sync_boundary_failure: (event: WaHistorySyncBoundaryFailureEvent) => void
     /**
      * A group-history bundle another member shared with this account after it
      * joined a group, already downloaded and persisted. Requires

@@ -327,8 +327,16 @@ export class WaMediaCrypto {
         encrypted: Readable,
         options: WaMediaDecryptReadableOptions
     ): Promise<WaMediaReadableDecryptionResult> {
+        if (
+            options.maxEncryptedBytes !== undefined &&
+            (!Number.isSafeInteger(options.maxEncryptedBytes) || options.maxEncryptedBytes < 0)
+        ) {
+            throw new Error('maxEncryptedBytes must be a non-negative safe integer')
+        }
         const keys = WaMediaCrypto.deriveKeys(options.mediaType, options.mediaKey)
         const plaintext = new PassThrough()
+        // Keep an early stream error observed until the caller attaches a consumer.
+        plaintext.on('error', () => undefined)
         const metadata = pumpDecryption(encrypted, plaintext, keys, options)
         return { plaintext, metadata }
     }
@@ -468,6 +476,7 @@ async function pumpDecryption(
     const hmac = createHmac('sha256', keys.macKey)
     const trailingScratch = new Uint8Array(HMAC_TRUNCATED_SIZE)
     let trailingLength = 0
+    let encryptedByteLength = 0
 
     const consumeCiphertext = async (part: Uint8Array): Promise<void> => {
         hmac.update(part)
@@ -485,6 +494,14 @@ async function pumpDecryption(
             const bytes = toChunkBytes(chunk)
             if (bytes.byteLength === 0) {
                 continue
+            }
+            encryptedByteLength += bytes.byteLength
+            if (
+                options.maxEncryptedBytes !== undefined &&
+                (!Number.isSafeInteger(encryptedByteLength) ||
+                    encryptedByteLength > options.maxEncryptedBytes)
+            ) {
+                throw new Error('encrypted media download exceeds the configured byte limit')
             }
             encHash.update(bytes)
             const total = trailingLength + bytes.byteLength

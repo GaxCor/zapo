@@ -7,7 +7,11 @@ import type {
     WaIncomingUnavailableMessageEvent
 } from '@client/types'
 import { createNoopLogger } from '@infra/log/types'
-import { buildRecoveredIncomingEvent, handleIncomingMessageAck } from '@message/primitives/incoming'
+import {
+    buildRecoveredIncomingEvent,
+    handleIncomingMessageAck,
+    type WaDeferredHistoryReceipt
+} from '@message/primitives/incoming'
 import { proto } from '@proto'
 import type { WaRetryDecryptFailureContext } from '@retry/types'
 import type { BinaryNode } from '@transport/types'
@@ -102,6 +106,87 @@ test('incoming message ack suppresses standard receipt when decrypt failure is d
     assert.equal(decryptFailures[0].context.t, '123')
     assert.match((decryptFailures[0].error as Error).message, /decrypt failed/)
     assert.equal(sentNodes.length, 0)
+})
+
+test('history boundary withholds delivery receipt until callback capability completes', async () => {
+    const sent: string[] = []
+    let deferred: WaDeferredHistoryReceipt | undefined
+    const message: proto.IMessage = {
+        protocolMessage: {
+            type: proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+            historySyncNotification: { syncType: proto.Message.HistorySyncType.RECENT }
+        }
+    }
+    const handled = await handleIncomingMessageAck(createEncryptedMessageNode(), {
+        ...createDecryptingOptions([], { message }),
+        sendNode: async (node) => {
+            sent.push(node.tag + ':' + (node.attrs.type ?? 'delivery'))
+        },
+        captureBoundSendNode: () => async (node) => {
+            sent.push(node.tag + ':' + (node.attrs.type ?? 'delivery'))
+        },
+        scheduleHistorySync: (_event, receipt) => {
+            deferred = receipt
+            return true
+        }
+    })
+
+    assert.equal(handled, true)
+    assert.deepEqual(sent, [], 'history scheduling must not send ordinary delivery inline')
+    assert.ok(deferred)
+    deferred.complete()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.deepEqual(sent, ['receipt:delivery'])
+    await deferred.sendHistorySyncReceipt()
+    await deferred.sendHistorySyncReceipt()
+    assert.deepEqual(sent, ['receipt:delivery', 'receipt:hist_sync'])
+})
+
+test('history boundary failure suppresses ordinary and hist_sync receipts', async () => {
+    const sent: string[] = []
+    let deferred: WaDeferredHistoryReceipt | undefined
+    const message: proto.IMessage = {
+        protocolMessage: {
+            type: proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+            historySyncNotification: { syncType: proto.Message.HistorySyncType.RECENT }
+        }
+    }
+    await handleIncomingMessageAck(createEncryptedMessageNode(), {
+        ...createDecryptingOptions([], { message }),
+        sendNode: async (node) => {
+            sent.push(node.tag + ':' + (node.attrs.type ?? 'delivery'))
+        },
+        captureBoundSendNode: () => async (node) => {
+            sent.push(node.tag + ':' + (node.attrs.type ?? 'delivery'))
+        },
+        scheduleHistorySync: (_event, receipt) => {
+            deferred = receipt
+            return true
+        }
+    })
+
+    assert.ok(deferred)
+    deferred.fail()
+    await deferred.sendHistorySyncReceipt()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.deepEqual(sent, [])
+})
+
+test('history boundary leaves ordinary live-message receipt and event behavior unchanged', async () => {
+    const events: WaIncomingMessageEvent[] = []
+    const sent: string[] = []
+    const handled = await handleIncomingMessageAck(createEncryptedMessageNode(), {
+        ...createDecryptingOptions(events),
+        sendNode: async (node) => {
+            sent.push(node.tag + ':' + (node.attrs.type ?? 'delivery'))
+        },
+        captureBoundSendNode: () => async (node) => {
+            sent.push(node.tag + ':' + (node.attrs.type ?? 'delivery'))
+        }
+    })
+    assert.equal(handled, true)
+    assert.equal(events.length, 1)
+    assert.deepEqual(sent, ['receipt:delivery'])
 })
 
 test('1:1 incoming message strips the device from remoteJid and keeps it in senderDevice', async () => {

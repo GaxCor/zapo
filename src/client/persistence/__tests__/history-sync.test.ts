@@ -11,6 +11,7 @@ import {
     processHistorySyncNotification
 } from '@client/persistence/history-sync'
 import { WriteBehindPersistence } from '@client/persistence/WriteBehindPersistence'
+import type { WaHistorySyncMessageObservation } from '@client/types'
 import { createNoopLogger } from '@infra/log/types'
 import { proto, type Proto } from '@proto'
 import type { WaStoredContactRecord } from '@store/contracts/contact.store'
@@ -162,6 +163,207 @@ test('history sync converts Conversation.ephemeralSettingTimestamp from ms to se
     assert.ok(thread, 'conversation should be persisted as a thread row')
     assert.equal(thread.ephemeralExpiration, 86_400)
     assert.equal(thread.ephemeralSettingTimestamp, 1_751_808_692)
+})
+
+test('history boundary preserves duplicate source observations before ID-only writes and excludes non-direct detail', async () => {
+    const { capture, deps } = createCapture()
+    const payload = proto.HistorySync.encode({
+        syncType: proto.HistorySync.HistorySyncType.RECENT,
+        chunkOrder: 4,
+        progress: 44,
+        conversations: [
+            {
+                id: '5511000000001@s.whatsapp.net',
+                messages: [
+                    {
+                        msgOrderId: 7,
+                        message: {
+                            key: {
+                                remoteJid: '5511000000001@s.whatsapp.net',
+                                id: 'DUPLICATE',
+                                fromMe: false
+                            },
+                            message: { conversation: 'first' },
+                            messageTimestamp: 1_700_000_001
+                        }
+                    }
+                ]
+            },
+            {
+                id: '5511000000002@s.whatsapp.net',
+                messages: [
+                    {
+                        msgOrderId: 7,
+                        message: {
+                            key: {
+                                remoteJid: '5511000000002@s.whatsapp.net',
+                                id: 'DUPLICATE',
+                                fromMe: false
+                            },
+                            message: { extendedTextMessage: { text: '' } },
+                            messageTimestamp: 1_700_000_002
+                        }
+                    }
+                ]
+            },
+            {
+                id: '120363000000000000@g.us',
+                messages: [
+                    {
+                        message: {
+                            key: {
+                                remoteJid: '120363000000000000@g.us',
+                                id: 'PRIVATE-GROUP-ID',
+                                fromMe: true,
+                                participant: '5511999999999@s.whatsapp.net'
+                            },
+                            message: { conversation: 'private group body' },
+                            messageTimestamp: 1_700_000_003
+                        }
+                    }
+                ]
+            }
+        ]
+    }).finish()
+    const notification = {
+        syncType: proto.Message.HistorySyncType.RECENT,
+        chunkOrder: 5,
+        progress: 43,
+        originalMessageId: 'source-message-id',
+        oldestMsgInChunkTimestampSec: 1_700_000_000,
+        initialHistBootstrapInlinePayload: toBytesView(await gzipAsync(payload))
+    }
+    const signal = new AbortController().signal
+    let callbackSawNoMessageWrites = false
+    let observations: readonly WaHistorySyncMessageObservation[] = []
+
+    await processHistorySyncNotification(deps as never, notification, {
+        limits: {
+            maxConcurrentBatches: 1,
+            maxQueuedBatches: 1,
+            maxQueuedBytes: 16_384,
+            maxBatchBytes: 16_384,
+            maxMessagesPerBatch: 10,
+            maxSourceRecordsPerBatch: 128,
+            timeoutMs: 1_000
+        },
+        signal,
+        onBatch: async (batch) => {
+            callbackSawNoMessageWrites = capture.messages.length === 0
+            observations = batch.messageObservations
+            assert.equal(batch.parseReachedEof, true)
+            assert.equal(batch.payloadIntegrityVerified, true)
+            assert.equal(batch.sourceHistoryCompleteness, 'UNKNOWN')
+            assert.deepEqual(batch.metadataConflicts, [
+                'notification_payload_chunk_order_mismatch',
+                'notification_payload_progress_mismatch'
+            ])
+            assert.equal(batch.notification.oldestMsgInChunkTimestampSec, '1700000000')
+            assert.equal(batch.decoded.chunkOrder, 4)
+            assert.equal(batch.notification.chunkOrder, 5)
+        }
+    })
+
+    assert.equal(callbackSawNoMessageWrites, true)
+    assert.equal(observations.length, 3)
+    assert.deepEqual(
+        observations
+            .slice(0, 2)
+            .map((item) => [
+                item.ordinal,
+                item.conversationOrdinal,
+                item.externalMessageId,
+                item.fromMe,
+                item.content
+            ]),
+        [
+            [1, 1, 'DUPLICATE', false, { kind: 'TEXT', text: 'first' }],
+            [2, 2, 'DUPLICATE', false, { kind: 'TEXT', text: '' }]
+        ]
+    )
+    assert.equal(observations[2].disposition, 'EXCLUDED_GROUP')
+    assert.equal(observations[2].externalMessageId, undefined)
+    assert.equal(observations[2].fromMe, undefined)
+    assert.equal(observations[2].timestampSeconds, undefined)
+    assert.equal(JSON.stringify(observations).includes('private group body'), false)
+    assert.equal(JSON.stringify(observations).includes('PRIVATE-GROUP-ID'), false)
+    assert.deepEqual(
+        capture.messages.map((record) => record.id),
+        ['DUPLICATE', 'DUPLICATE', 'PRIVATE-GROUP-ID'],
+        'post-callback Zapo mailbox writes may coalesce later, but callback sees both occurrences'
+    )
+})
+
+test('history boundary rejects unknown root families before callback and receipt completion', async () => {
+    const { capture, deps } = createCapture()
+    const payload = proto.HistorySync.encode({
+        syncType: proto.HistorySync.HistorySyncType.RECENT,
+        conversations: [{ id: '5511000000001@s.whatsapp.net', messages: [] }],
+        recentStickers: [{}]
+    }).finish()
+    const inlinePayload = toBytesView(await gzipAsync(payload))
+    let callbackCalled = false
+    await assert.rejects(
+        () =>
+            processHistorySyncNotification(
+                deps as never,
+                {
+                    syncType: proto.Message.HistorySyncType.RECENT,
+                    initialHistBootstrapInlinePayload: inlinePayload
+                },
+                {
+                    limits: {
+                        maxConcurrentBatches: 1,
+                        maxQueuedBatches: 0,
+                        maxQueuedBytes: 0,
+                        maxBatchBytes: 16_384,
+                        maxMessagesPerBatch: 1,
+                        maxSourceRecordsPerBatch: 32,
+                        timeoutMs: 1_000
+                    },
+                    signal: new AbortController().signal,
+                    onBatch: async () => {
+                        callbackCalled = true
+                    }
+                }
+            ),
+        /unsupported_history_root_family/
+    )
+    assert.equal(callbackCalled, false)
+    assert.deepEqual(capture.acked, [])
+})
+
+test('history boundary rejects unknown notification fields before callback and receipt completion', async () => {
+    const { capture, deps } = createCapture()
+    let callbackCalled = false
+    await assert.rejects(
+        () =>
+            processHistorySyncNotification(
+                deps as never,
+                {
+                    syncType: proto.Message.HistorySyncType.RECENT,
+                    $unknowns: [new Uint8Array([0x78, 0x01])]
+                },
+                {
+                    limits: {
+                        maxConcurrentBatches: 1,
+                        maxQueuedBatches: 0,
+                        maxQueuedBytes: 0,
+                        maxBatchBytes: 16_384,
+                        maxMessagesPerBatch: 1,
+                        maxSourceRecordsPerBatch: 32,
+                        timeoutMs: 1_000
+                    },
+                    signal: new AbortController().signal,
+                    onBatch: async () => {
+                        callbackCalled = true
+                    }
+                }
+            ),
+        /history boundary notification contains unknown fields/
+    )
+    assert.equal(callbackCalled, false)
+    assert.deepEqual(capture.acked, [])
 })
 
 test('history sync keeps an already-seconds Conversation timestamp untouched', async () => {
@@ -488,6 +690,7 @@ test('history sync abort on a corrupt conversation settles pending writes', asyn
 test('history sync field numbers match the generated encoder', () => {
     assert.deepEqual(
         {
+            SYNC_TYPE: encodedFieldNumber(proto.HistorySync, { syncType: 1 }),
             CONVERSATIONS: encodedFieldNumber(proto.HistorySync, { conversations: [{ id: 'x' }] }),
             CHUNK_ORDER: encodedFieldNumber(proto.HistorySync, { chunkOrder: 1 }),
             PROGRESS: encodedFieldNumber(proto.HistorySync, { progress: 1 }),

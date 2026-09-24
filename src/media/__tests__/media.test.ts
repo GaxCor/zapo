@@ -973,6 +973,54 @@ test('media transfer client applies separate upload/download agents', async () =
     }
 })
 
+test('media transfer client enforces encrypted byte limits before streaming decryption', async () => {
+    const mediaKey = await WaMediaCrypto.generateMediaKey()
+    const encrypted = await WaMediaCrypto.encryptBytes(
+        'history',
+        mediaKey,
+        new Uint8Array([1, 2, 3, 4])
+    )
+    const server = http.createServer((_request, response) => {
+        response.writeHead(200, { 'content-type': 'application/octet-stream' })
+        response.end(encrypted.ciphertextHmac)
+    })
+    await new Promise<void>((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(0, '127.0.0.1', () => {
+            server.off('error', reject)
+            resolve()
+        })
+    })
+    const address = server.address()
+    if (!address || typeof address === 'string') {
+        throw new Error('failed to resolve encrypted media test server address')
+    }
+
+    try {
+        const mediaTransfer = new WaMediaTransferClient()
+        const result = await mediaTransfer.downloadAndDecryptStream({
+            url: `http://127.0.0.1:${address.port}/history`,
+            mediaType: 'history',
+            mediaKey,
+            fileSha256: encrypted.fileSha256,
+            fileEncSha256: encrypted.fileEncSha256,
+            maxEncryptedBytes: encrypted.ciphertextHmac.byteLength - 1
+        })
+        await assert.rejects(
+            () => readAllFromStream(result.plaintext),
+            /encrypted media download exceeds the configured byte limit/
+        )
+        await assert.rejects(
+            result.metadata,
+            /encrypted media download exceeds the configured byte limit/
+        )
+    } finally {
+        await new Promise<void>((resolve) => {
+            server.close(() => resolve())
+        })
+    }
+})
+
 test('media transfer client routes through optional got when proxy agent is set', async () => {
     const server = http.createServer((_request, response) => {
         response.writeHead(200, { 'content-type': 'text/plain' })

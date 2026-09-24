@@ -688,6 +688,62 @@ test('resolveWaClientBase accepts proxy agent shapes', () => {
     assert.doesNotThrow(() => resolveWaClientBase(options, createNoopLogger()))
 })
 
+test('resolveWaClientBase requires finite explicit limits for the history boundary', () => {
+    const minimalStore = {
+        session: () => ({})
+    }
+    const missingLimits = {
+        store: minimalStore,
+        sessionId: 'session',
+        history: { onBatch: async () => undefined }
+    } as unknown as WaClientOptions
+    const invalidLimit = {
+        store: minimalStore,
+        sessionId: 'session',
+        history: {
+            onBatch: async () => undefined,
+            boundaryLimits: {
+                maxConcurrentBatches: 1,
+                maxQueuedBatches: 0,
+                maxQueuedBytes: 0,
+                maxBatchBytes: 1,
+                maxMessagesPerBatch: 1,
+                maxSourceRecordsPerBatch: 1,
+                timeoutMs: Number.POSITIVE_INFINITY
+            }
+        }
+    } as unknown as WaClientOptions
+    const overflowingTimerLimit = {
+        store: minimalStore,
+        sessionId: 'session',
+        history: {
+            onBatch: async () => undefined,
+            boundaryLimits: {
+                maxConcurrentBatches: 1,
+                maxQueuedBatches: 0,
+                maxQueuedBytes: 0,
+                maxBatchBytes: 1,
+                maxMessagesPerBatch: 1,
+                maxSourceRecordsPerBatch: 1,
+                timeoutMs: 2_147_483_648
+            }
+        }
+    } as unknown as WaClientOptions
+
+    assert.throws(
+        () => resolveWaClientBase(missingLimits, createNoopLogger()),
+        /history.boundaryLimits are required/
+    )
+    assert.throws(
+        () => resolveWaClientBase(invalidLimit, createNoopLogger()),
+        /timeoutMs must be a positive safe integer/
+    )
+    assert.throws(
+        () => resolveWaClientBase(overflowingTimerLimit, createNoopLogger()),
+        /timeoutMs must not exceed 2147483647/
+    )
+})
+
 test('buildWaClientDependencies wires privacy coordinator', () => {
     const sessionStore = {
         auth: {} as never,

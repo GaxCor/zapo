@@ -93,5 +93,6 @@ export interface WaMediaDecryptReadableOptions {
     readonly mediaKey: Uint8Array
     readonly expectedFileSha256?: Uint8Array
     readonly expectedFileEncSha256?: Uint8Array
+    readonly maxEncryptedBytes?: number
     readonly skipMacVerification?: boolean
 }

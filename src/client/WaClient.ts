@@ -22,7 +22,11 @@ import {
     persistIncomingEphemeralSetting
 } from '@client/persistence/ephemeral-setting'
 import { runGroupHistoryBundle } from '@client/persistence/group-history'
-import { runHistorySyncNotification } from '@client/persistence/history-sync'
+import {
+    processHistorySyncNotification,
+    runHistorySyncNotification
+} from '@client/persistence/history-sync'
+import { HistorySyncBoundaryWorker } from '@client/persistence/HistorySyncBoundaryWorker'
 import { persistIncomingMailboxEntities } from '@client/persistence/mailbox'
 import { WriteBehindPersistence } from '@client/persistence/WriteBehindPersistence'
 import { installWaClientPlugins, type WaClientPluginInstallInput } from '@client/plugins/install'
@@ -48,6 +52,7 @@ import { ConsoleLogger } from '@infra/log/ConsoleLogger'
 import type { Logger } from '@infra/log/types'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import { unwrapMessage } from '@message/encode/content'
+import type { WaDeferredHistoryReceipt } from '@message/primitives/incoming'
 import { proto, type Proto } from '@proto'
 import { WA_DEFAULTS, WA_MESSAGE_TYPES } from '@protocol/constants'
 import { normalizeDeviceJid } from '@protocol/jid'
@@ -75,6 +80,7 @@ class WaClientImpl extends EventEmitter {
     private readonly appStateSync!: WaAppStateSyncClient
     private readonly mediaTransfer!: WaMediaTransferClient
     private readonly writeBehind!: WriteBehindPersistence
+    private historyBoundaryWorker: HistorySyncBoundaryWorker | null = null
     private readonly observeEphemeralSetting!: (event: WaIncomingMessageEvent) => void
     private connectPromise: Promise<void> | null = null
     private acceptingIncomingEvents = true
@@ -121,6 +127,7 @@ class WaClientImpl extends EventEmitter {
                 emitEvent: this.emit.bind(this),
                 hasEventListener: (event) => this.listenerCount(event) > 0,
                 handleIncomingMessageEvent: this.handleIncomingMessageEvent.bind(this),
+                handleIncomingHistorySyncEvent: this.handleIncomingHistorySyncEvent.bind(this),
                 handleError: this.handleError.bind(this),
                 handleIncomingFrame: this.handleIncomingFrame.bind(this),
                 clearStoredState: this.clearStoredState.bind(this),
@@ -139,6 +146,18 @@ class WaClientImpl extends EventEmitter {
         this.deps = dependencies
         this.appStateSync = dependencies.appStateSync
         this.mediaTransfer = dependencies.mediaTransfer
+        const historyOptions = this.options.history
+        if (historyOptions?.onBatch && historyOptions.boundaryLimits) {
+            this.historyBoundaryWorker = new HistorySyncBoundaryWorker(
+                historyOptions.boundaryLimits,
+                (notification, signal, receipt) =>
+                    this.processHistorySyncBoundary(notification, signal, receipt),
+                (reason) => {
+                    this.emit('history_sync_boundary_failure', { reason })
+                    this.logger.warn('history boundary work did not complete', { reason })
+                }
+            )
+        }
 
         this.pluginInstallInput = {
             options: this.options,
@@ -286,6 +305,16 @@ class WaClientImpl extends EventEmitter {
             return
         }
         try {
+            if (
+                this.options.history?.onBatch &&
+                event.message?.protocolMessage?.type ===
+                    proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION
+            ) {
+                this.logger.warn(
+                    'history notification reached live-message path without receipt gate'
+                )
+                return
+            }
             this.emit('message', event)
             this.observeEphemeralSetting(event)
             void persistIncomingMailboxEntities({
@@ -419,6 +448,68 @@ class WaClientImpl extends EventEmitter {
         } finally {
             this.leaveIncomingHandler()
         }
+    }
+
+    private handleIncomingHistorySyncEvent(
+        event: WaIncomingMessageEvent,
+        receipt: WaDeferredHistoryReceipt
+    ): boolean {
+        const notification = event.message?.protocolMessage?.historySyncNotification
+        if (!notification || !this.historyBoundaryWorker) {
+            receipt.fail()
+            return false
+        }
+        if (!this.tryEnterIncomingHandler()) {
+            receipt.fail()
+            return false
+        }
+        return this.historyBoundaryWorker.enqueue(notification, receipt, () =>
+            this.leaveIncomingHandler()
+        )
+    }
+
+    private async processHistorySyncBoundary(
+        notification: Proto.Message.IHistorySyncNotification,
+        signal: AbortSignal,
+        receipt: WaDeferredHistoryReceipt
+    ): Promise<void> {
+        const history = this.options.history
+        if (!history?.onBatch || !history.boundaryLimits) {
+            throw new Error('history boundary is not configured')
+        }
+        await processHistorySyncNotification(
+            {
+                logger: this.logger,
+                mediaTransfer: this.mediaTransfer,
+                chatMetadataStore: this.stores.chatMetadata,
+                writeBehind: this.writeBehind,
+                emitEvent: this.emit.bind(this),
+                onPrivacyTokens: (conversations) =>
+                    this.deps.trustedContactToken.hydrateFromHistorySync(conversations),
+                onNctSalt: (salt) =>
+                    this.deps.trustedContactToken.hydrateNctSaltFromHistorySync(salt),
+                onProcessed: async () => {
+                    if (!signal.aborted) {
+                        await receipt.sendHistorySyncReceipt()
+                    }
+                },
+                meJid: this.deps.authClient.getCurrentCredentials()?.meJid
+            },
+            notification,
+            {
+                limits: history.boundaryLimits,
+                signal,
+                onBatch: async (batch, context) => {
+                    await history.onBatch!(batch, context)
+                    if (signal.aborted) {
+                        throw signal.reason instanceof Error
+                            ? signal.reason
+                            : new Error('history boundary was cancelled')
+                    }
+                    receipt.complete()
+                }
+            }
+        )
     }
 
     /**
@@ -780,6 +871,7 @@ class WaClientImpl extends EventEmitter {
 
     private async pauseIncomingEventsAndWaitDrain(): Promise<void> {
         this.acceptingIncomingEvents = false
+        await this.historyBoundaryWorker?.cancelAndDrain()
         if (this.activeIncomingHandlers === 0) {
             return
         }
