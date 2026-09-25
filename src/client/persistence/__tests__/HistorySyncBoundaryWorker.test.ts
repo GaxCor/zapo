@@ -406,3 +406,33 @@ test('history worker accounts for nested opaque client bytes before queue admiss
     assert.deepEqual(itemReceipt.state, ['fail'])
     assert.deepEqual(failures, ['queue_full'])
 })
+
+test('history worker accounts for a retained protobuf byte view backing buffer', () => {
+    const backing = new Uint8Array(4_096)
+    const itemReceipt = receipt()
+    const failures: string[] = []
+    const worker = new HistorySyncBoundaryWorker(
+        {
+            ...LIMITS,
+            maxConcurrentBatches: 0,
+            maxQueuedBatches: 1,
+            maxQueuedBytes: 512,
+            maxBatchBytes: 8_192
+        },
+        async () => assert.fail('over-budget backing allocation must not be processed'),
+        (reason) => failures.push(reason)
+    )
+
+    assert.equal(
+        worker.enqueue(
+            { ...notification(), mediaKey: backing.subarray(0, 1) },
+            itemReceipt.value,
+            () => undefined
+        ),
+        false
+    )
+    assert.equal(worker.running(), 0)
+    assert.equal(worker.queued(), 0)
+    assert.deepEqual(itemReceipt.state, ['fail'])
+    assert.deepEqual(failures, ['queue_full'])
+})

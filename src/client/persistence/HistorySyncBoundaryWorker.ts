@@ -189,9 +189,16 @@ function estimateRetainedBytes(
     notification: Proto.Message.IHistorySyncNotification
 ): number | null {
     let size = 256
+    const countedBuffers = new Set<ArrayBufferLike>()
     const add = (value: Uint8Array | string | null | undefined): void => {
         if (value instanceof Uint8Array) {
-            size += value.byteLength
+            // protobufjs exposes decoded bytes as subarray views of the input
+            // buffer. The worker therefore retains the backing allocation, not
+            // only the visible range; count each source allocation once.
+            if (!countedBuffers.has(value.buffer)) {
+                countedBuffers.add(value.buffer)
+                size += value.buffer.byteLength
+            }
         } else if (typeof value === 'string') {
             size += value.length * 2
         }
