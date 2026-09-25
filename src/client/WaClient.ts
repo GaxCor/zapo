@@ -26,7 +26,10 @@ import {
     processHistorySyncNotification,
     runHistorySyncNotification
 } from '@client/persistence/history-sync'
-import { HistorySyncBoundaryWorker } from '@client/persistence/HistorySyncBoundaryWorker'
+import {
+    HistorySyncBoundaryWorker,
+    type HistorySyncCallbackLifecycle
+} from '@client/persistence/HistorySyncBoundaryWorker'
 import { persistIncomingMailboxEntities } from '@client/persistence/mailbox'
 import { WriteBehindPersistence } from '@client/persistence/WriteBehindPersistence'
 import { installWaClientPlugins, type WaClientPluginInstallInput } from '@client/plugins/install'
@@ -38,6 +41,7 @@ import type {
 import type {
     WaClientEventMap,
     WaClientOptions,
+    WaHistorySyncBoundaryState,
     WaIgnoreKey,
     WaIgnoreKeyPredicate,
     WaIncomingMessageEvent,
@@ -150,11 +154,20 @@ class WaClientImpl extends EventEmitter {
         if (historyOptions?.onBatch && historyOptions.boundaryLimits) {
             this.historyBoundaryWorker = new HistorySyncBoundaryWorker(
                 historyOptions.boundaryLimits,
-                (notification, signal, receipt) =>
-                    this.processHistorySyncBoundary(notification, signal, receipt),
+                (notification, signal, receipt, callbackLifecycle) =>
+                    this.processHistorySyncBoundary(
+                        notification,
+                        signal,
+                        receipt,
+                        callbackLifecycle
+                    ),
                 (reason) => {
                     this.emit('history_sync_boundary_failure', { reason })
                     this.logger.warn('history boundary work did not complete', { reason })
+                },
+                (reason) => {
+                    this.emit('history_sync_boundary_fault', { state: 'FAULTED', reason })
+                    this.logger.warn('history boundary entered terminal faulted state', { reason })
                 }
             )
         }
@@ -263,6 +276,11 @@ class WaClientImpl extends EventEmitter {
         const connected = this.deps.connectionManager.isConnected()
         this.logger.trace('wa client state requested', { connected })
         return this.deps.authClient.getState(connected)
+    }
+
+    /** Returns the per-client optional durable-history boundary state. */
+    public getHistorySyncBoundaryState(): WaHistorySyncBoundaryState {
+        return this.historyBoundaryWorker?.getStatus() ?? 'DISABLED'
     }
 
     /**
@@ -479,7 +497,8 @@ class WaClientImpl extends EventEmitter {
     private async processHistorySyncBoundary(
         notification: Proto.Message.IHistorySyncNotification,
         signal: AbortSignal,
-        receipt: WaDeferredHistoryReceipt
+        receipt: WaDeferredHistoryReceipt,
+        callbackLifecycle: HistorySyncCallbackLifecycle
     ): Promise<void> {
         const history = this.options.history
         if (!history?.onBatch || !history.boundaryLimits) {
@@ -508,7 +527,16 @@ class WaClientImpl extends EventEmitter {
                 limits: history.boundaryLimits,
                 signal,
                 onBatch: async (batch, context) => {
-                    await history.onBatch!(batch, context)
+                    if (!callbackLifecycle.onStart()) {
+                        throw signal.reason instanceof Error
+                            ? signal.reason
+                            : new Error('history boundary is no longer accepting callbacks')
+                    }
+                    try {
+                        await history.onBatch!(batch, context)
+                    } finally {
+                        callbackLifecycle.onSettled()
+                    }
                     if (signal.aborted) {
                         throw signal.reason instanceof Error
                             ? signal.reason

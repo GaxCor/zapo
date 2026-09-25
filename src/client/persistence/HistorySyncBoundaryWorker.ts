@@ -1,4 +1,10 @@
-import type { WaHistorySyncBoundaryLimits } from '@client/types'
+import { performance } from 'node:perf_hooks'
+
+import type {
+    WaHistorySyncBoundaryFaultReason,
+    WaHistorySyncBoundaryLimits,
+    WaHistorySyncBoundaryState
+} from '@client/types'
 import type { WaDeferredHistoryReceipt } from '@message/primitives/incoming'
 import type { Proto } from '@proto'
 
@@ -11,13 +17,25 @@ interface QueuedHistoryWork {
 
 interface ActiveHistoryWork extends QueuedHistoryWork {
     readonly controller: AbortController
+    readonly deadlineAt: number
     timeout: ReturnType<typeof setTimeout> | null
+    callbackStarted: boolean
+    callbackPending: boolean
+    timedOut: boolean
+}
+
+export interface HistorySyncCallbackLifecycle {
+    /** Returns false when the deadline/fault has already made callback admission terminal. */
+    readonly onStart: () => boolean
+    /** Observes settlement without retaining the promise in a worker-owned collection. */
+    readonly onSettled: () => void
 }
 
 export type ProcessHistorySyncWork = (
     notification: Proto.Message.IHistorySyncNotification,
     signal: AbortSignal,
-    receipt: WaDeferredHistoryReceipt
+    receipt: WaDeferredHistoryReceipt,
+    callbackLifecycle: HistorySyncCallbackLifecycle
 ) => Promise<void>
 
 /** Per-client bounded executor for the optional durable-history boundary. */
@@ -25,21 +43,27 @@ export class HistorySyncBoundaryWorker {
     private readonly limits: WaHistorySyncBoundaryLimits
     private readonly process: ProcessHistorySyncWork
     private readonly onFailure: (
-        reason: 'queue_full' | 'processing_failed' | 'timeout' | 'cancelled'
+        reason: 'queue_full' | 'processing_failed' | 'timeout' | 'cancelled' | 'faulted'
     ) => void
+    private readonly onFault: (reason: WaHistorySyncBoundaryFaultReason) => void
     private readonly queue: QueuedHistoryWork[] = []
     private readonly active = new Map<ActiveHistoryWork, true>()
     private queuedBytes = 0
     private readonly drainWaiters: Array<() => void> = []
+    private status: Exclude<WaHistorySyncBoundaryState, 'DISABLED'> = 'AVAILABLE'
 
     public constructor(
         limits: WaHistorySyncBoundaryLimits,
         process: ProcessHistorySyncWork,
-        onFailure: (reason: 'queue_full' | 'processing_failed' | 'timeout' | 'cancelled') => void
+        onFailure: (
+            reason: 'queue_full' | 'processing_failed' | 'timeout' | 'cancelled' | 'faulted'
+        ) => void,
+        onFault: (reason: WaHistorySyncBoundaryFaultReason) => void = () => undefined
     ) {
         this.limits = limits
         this.process = process
         this.onFailure = onFailure
+        this.onFault = onFault
     }
 
     /** Synchronous admission only; payload work always starts in a later microtask. */
@@ -49,6 +73,13 @@ export class HistorySyncBoundaryWorker {
         onSettled: () => void,
         hasUnsupportedEnvelopeUnknowns = false
     ): boolean {
+        if (this.status === 'FAULTED') {
+            receipt.fail()
+            onSettled()
+            this.onFailure('faulted')
+            return false
+        }
+
         if (hasUnsupportedEnvelopeUnknowns || hasUnsupportedUnknownFields(notification)) {
             receipt.fail()
             onSettled()
@@ -103,10 +134,16 @@ export class HistorySyncBoundaryWorker {
         return true
     }
 
-    /** Cancels queued/active work and waits for abort-aware active work to unwind. */
+    /**
+     * Cancels queued/active work and waits for library-owned processing to unwind.
+     * Non-cooperative application callback promises may outlive this finite drain.
+     */
     public async cancelAndDrain(
         reason: unknown = new Error('history worker stopped')
     ): Promise<void> {
+        if ([...this.active.keys()].some((work) => work.callbackPending)) {
+            this.enterFault('callback_cancelled')
+        }
         while (this.queue.length > 0) {
             const work = this.queue.shift()!
             this.queuedBytes -= work.retainedBytes
@@ -116,8 +153,10 @@ export class HistorySyncBoundaryWorker {
         }
         for (const work of this.active.keys()) {
             work.receipt.fail()
-            work.controller.abort(reason)
-            this.onFailure('cancelled')
+            if (!work.controller.signal.aborted) {
+                work.controller.abort(reason)
+                this.onFailure('cancelled')
+            }
         }
         if (this.active.size === 0) {
             return
@@ -133,17 +172,23 @@ export class HistorySyncBoundaryWorker {
         return this.active.size
     }
 
+    public getStatus(): Exclude<WaHistorySyncBoundaryState, 'DISABLED'> {
+        return this.status
+    }
+
     private start(work: QueuedHistoryWork): void {
         const activeWork: ActiveHistoryWork = {
             ...work,
             controller: new AbortController(),
-            timeout: null
+            deadlineAt: performance.now() + this.limits.timeoutMs,
+            timeout: null,
+            callbackStarted: false,
+            callbackPending: false,
+            timedOut: false
         }
         this.active.set(activeWork, true)
         activeWork.timeout = setTimeout(() => {
-            activeWork.receipt.fail()
-            activeWork.controller.abort(new Error('history boundary processing timed out'))
-            this.onFailure('timeout')
+            this.timeoutWork(activeWork)
         }, this.limits.timeoutMs)
         activeWork.timeout.unref?.()
         queueMicrotask(() => {
@@ -152,14 +197,24 @@ export class HistorySyncBoundaryWorker {
     }
 
     private async run(work: ActiveHistoryWork): Promise<void> {
+        const callbackLifecycle = this.createCallbackLifecycle(work)
         try {
-            await this.process(work.notification, work.controller.signal, work.receipt)
+            await this.process(
+                work.notification,
+                work.controller.signal,
+                work.receipt,
+                callbackLifecycle
+            )
         } catch {
             work.receipt.fail()
             if (!work.controller.signal.aborted) {
                 this.onFailure('processing_failed')
             }
         } finally {
+            // A non-cooperative callback may still retain the lifecycle object.
+            // Detach it from the job so its late settlement cannot retain the
+            // notification, receipt, or worker accounting record.
+            callbackLifecycle.detach()
             work.receipt.fail()
             if (work.timeout) {
                 clearTimeout(work.timeout)
@@ -172,7 +227,11 @@ export class HistorySyncBoundaryWorker {
     }
 
     private startQueued(): void {
-        while (this.active.size < this.limits.maxConcurrentBatches && this.queue.length > 0) {
+        while (
+            this.status === 'AVAILABLE' &&
+            this.active.size < this.limits.maxConcurrentBatches &&
+            this.queue.length > 0
+        ) {
             const work = this.queue.shift()!
             this.queuedBytes -= work.retainedBytes
             this.start(work)
@@ -186,6 +245,100 @@ export class HistorySyncBoundaryWorker {
         const waiters = this.drainWaiters.splice(0)
         for (const resolve of waiters) {
             resolve()
+        }
+    }
+
+    private createCallbackLifecycle(
+        work: ActiveHistoryWork
+    ): HistorySyncCallbackLifecycle & { detach(): void } {
+        let owner: HistorySyncBoundaryWorker | null = this
+        let trackedWork: ActiveHistoryWork | null = work
+        return {
+            onStart: () => {
+                const lifecycleOwner = owner
+                const activeWork = trackedWork
+                return lifecycleOwner && activeWork
+                    ? lifecycleOwner.startCallback(activeWork)
+                    : false
+            },
+            onSettled: () => {
+                const lifecycleOwner = owner
+                const settledWork = trackedWork
+                owner = null
+                if (!settledWork) return
+                trackedWork = null
+                lifecycleOwner?.settleCallback(settledWork)
+            },
+            detach: () => {
+                trackedWork = null
+                owner = null
+            }
+        }
+    }
+
+    private startCallback(work: ActiveHistoryWork): boolean {
+        if (this.status === 'FAULTED' || work.controller.signal.aborted || !this.active.has(work)) {
+            return false
+        }
+        if (performance.now() >= work.deadlineAt) {
+            this.timeoutWork(work)
+            return false
+        }
+        work.callbackStarted = true
+        work.callbackPending = true
+        return true
+    }
+
+    private settleCallback(work: ActiveHistoryWork): void {
+        if (!work.callbackPending) return
+        work.callbackPending = false
+        // A synchronous callback can block the event loop past its timer. Enforce
+        // the same deadline at the first instruction after it settles.
+        if (work.callbackStarted && performance.now() >= work.deadlineAt && !work.timedOut) {
+            this.timeoutWork(work)
+            this.enterFault('callback_timeout')
+        }
+    }
+
+    private timeoutWork(work: ActiveHistoryWork): void {
+        if (work.timedOut) return
+        work.timedOut = true
+        work.receipt.fail()
+        work.controller.abort(new Error('history boundary processing timed out'))
+        if (work.callbackPending) {
+            this.enterFault('callback_timeout')
+        }
+        this.onFailure('timeout')
+    }
+
+    private enterFault(reason: WaHistorySyncBoundaryFaultReason): void {
+        if (this.status === 'FAULTED') return
+        this.status = 'FAULTED'
+
+        let rejectedQueuedCount = 0
+        while (this.queue.length > 0) {
+            const work = this.queue.shift()!
+            this.queuedBytes -= work.retainedBytes
+            work.receipt.fail()
+            work.onSettled()
+            rejectedQueuedCount += 1
+        }
+
+        let cancelledActiveCount = 0
+        for (const work of this.active.keys()) {
+            work.receipt.fail()
+            if (!work.controller.signal.aborted) {
+                work.controller.abort(new Error('history boundary is faulted'))
+                cancelledActiveCount += 1
+            }
+        }
+
+        this.onFault(reason)
+        for (let index = 0; index < rejectedQueuedCount; index += 1) {
+            this.onFailure('faulted')
+        }
+        for (let index = 0; index < cancelledActiveCount; index += 1) {
+            this.onFailure('cancelled')
         }
     }
 }

@@ -13,6 +13,8 @@ import {
     type WaDeferredHistoryReceipt
 } from '@message/primitives/incoming'
 import { proto, type Proto } from '@proto'
+import type { RawWebSocketConstructor } from '@transport/types'
+import { WaComms } from '@transport/WaComms'
 
 const LIMITS = {
     maxConcurrentBatches: 1,
@@ -26,6 +28,33 @@ const LIMITS = {
 
 function notification(): Proto.Message.IHistorySyncNotification {
     return { syncType: 3, fileLength: 1 }
+}
+
+function createCommsForGenerationTest(): WaComms {
+    const socketConstructor = class {
+        public binaryType = 'arraybuffer'
+        public readyState = 0
+        public onopen: unknown = null
+        public onclose: unknown = null
+        public onerror: unknown = null
+        public onmessage: unknown = null
+        public close(): void {}
+        public send(): void {}
+    } as unknown as RawWebSocketConstructor
+    return new WaComms(
+        {
+            urls: ['wss://example.invalid/ws'],
+            rawWebSocketConstructor: socketConstructor,
+            noise: {
+                clientStaticKeyPair: {
+                    pubKey: new Uint8Array(32),
+                    privKey: new Uint8Array(32)
+                },
+                isRegistered: false
+            }
+        },
+        createNoopLogger()
+    )
 }
 
 function receipt(): { readonly value: WaDeferredHistoryReceipt; readonly state: string[] } {
@@ -249,12 +278,18 @@ test('history worker timeout aborts a never-resolving callback and never complet
     const settled = deferred()
     const releaseLateCallback = deferred()
     const lateCallbackSettled = deferred()
+    const faulted = deferred()
     const keepAlive = setTimeout(() => undefined, 1_000)
     const itemReceipt = receipt()
+    let callbackPending = false
     const worker = new HistorySyncBoundaryWorker(
         { ...LIMITS, maxQueuedBatches: 0, maxQueuedBytes: 0, timeoutMs: 15 },
-        async (_input, signal, currentReceipt) => {
+        async (_input, signal, currentReceipt, callbackLifecycle) => {
+            assert.equal(callbackLifecycle.onStart(), true)
+            callbackPending = true
             void releaseLateCallback.promise.then(() => {
+                callbackPending = false
+                callbackLifecycle.onSettled()
                 currentReceipt.complete()
                 lateCallbackSettled.resolve()
             })
@@ -266,17 +301,239 @@ test('history worker timeout aborts a never-resolving callback and never complet
         (reason) => {
             assert.equal(reason, 'timeout')
             timedOut.resolve()
+        },
+        (reason) => {
+            assert.equal(reason, 'callback_timeout')
+            faulted.resolve()
         }
     )
     worker.enqueue(notification(), itemReceipt.value, () => settled.resolve())
     await started.promise
     await timedOut.promise
+    await faulted.promise
     await settled.promise
     clearTimeout(keepAlive)
+    assert.equal(callbackPending, true, 'worker must not pretend callback code terminated')
+    assert.equal(worker.getStatus(), 'FAULTED')
+    assert.equal(worker.running(), 0, 'the abortable job settles without waiting for callback code')
     releaseLateCallback.resolve()
     await lateCallbackSettled.promise
     assert.deepEqual(itemReceipt.state, ['fail'])
+    assert.equal(worker.getStatus(), 'FAULTED', 'late callback completion cannot clear the fault')
+})
+
+test('faulted history worker rejects future jobs while live direct-message receipts continue', async () => {
+    const callback = deferred()
+    const callbackStarted = deferred()
+    const faulted = deferred()
+    const firstReceipt = receipt()
+    const laterReceipt = receipt()
+    const keepAlive = setTimeout(() => undefined, 1_000)
+    let callbackPending = false
+    let callbackStarts = 0
+    const worker = new HistorySyncBoundaryWorker(
+        { ...LIMITS, maxConcurrentBatches: 1, maxQueuedBatches: 1, timeoutMs: 15 },
+        async (_input, signal, _currentReceipt, lifecycle) => {
+            if (!lifecycle.onStart()) throw new Error('callback admission unexpectedly closed')
+            callbackStarts += 1
+            callbackPending = true
+            void callback.promise.then(() => {
+                callbackPending = false
+                lifecycle.onSettled()
+            })
+            callbackStarted.resolve()
+            await new Promise<void>((_resolve, reject) => {
+                signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+            })
+        },
+        () => undefined,
+        (reason) => {
+            assert.equal(reason, 'callback_timeout')
+            faulted.resolve()
+        }
+    )
+    worker.enqueue(notification(), firstReceipt.value, () => undefined)
+    await callbackStarted.promise
+    await faulted.promise
+    clearTimeout(keepAlive)
+    await worker.cancelAndDrain()
+    assert.equal(callbackPending, true)
+    assert.equal(worker.getStatus(), 'FAULTED')
     assert.equal(worker.running(), 0)
+
+    assert.equal(
+        worker.enqueue(notification(), laterReceipt.value, () => undefined),
+        false
+    )
+    assert.deepEqual(laterReceipt.state, ['fail'])
+    assert.equal(callbackStarts, 1, 'no post-fault callback may start')
+
+    // A real WaComms generation change models Noise-session replacement on
+    // reconnect; it cannot recreate this per-client worker or clear its fault.
+    const comms = createCommsForGenerationTest()
+    const replaceSession = (
+        comms as unknown as {
+            replaceNoiseSession(session: unknown): void
+        }
+    ).replaceNoiseSession.bind(comms)
+    replaceSession({ encryptFrame: async () => new Uint8Array([1]) })
+    const oldGeneration = comms.getConnectionGeneration()
+    replaceSession({ encryptFrame: async () => new Uint8Array([2]) })
+    assert.notEqual(comms.getConnectionGeneration(), oldGeneration)
+    assert.equal(worker.getStatus(), 'FAULTED')
+
+    const livePath: string[] = []
+    const liveHandled = await handleIncomingMessageAck(
+        {
+            tag: 'message',
+            attrs: { id: 'live-after-history-fault', from: '551100000000@s.whatsapp.net' },
+            content: [{ tag: 'enc', attrs: { type: 'msg' }, content: new Uint8Array([1]) }]
+        },
+        {
+            logger: createNoopLogger(),
+            sendNode: async () => {
+                livePath.push('receipt')
+            },
+            signalProtocol: {
+                decryptMessage: async () => {
+                    const bytes = proto.Message.encode({ conversation: 'still live' }).finish()
+                    const padded = new Uint8Array(bytes.length + 1)
+                    padded.set(bytes)
+                    padded[bytes.length] = 1
+                    return padded
+                }
+            } as never,
+            emitIncomingMessage: () => livePath.push('message')
+        }
+    )
+    assert.equal(liveHandled, true)
+    assert.deepEqual(livePath, ['message', 'receipt'])
+
+    callback.resolve()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.deepEqual(firstReceipt.state, ['fail'])
+    assert.equal(worker.getStatus(), 'FAULTED')
+})
+
+test('late non-cooperative callback rejection is observed after finite shutdown', async () => {
+    let rejectCallback!: (error: Error) => void
+    const appCallback = new Promise<void>((_resolve, reject) => {
+        rejectCallback = reject
+    })
+    const callbackStarted = deferred()
+    const callbackSettled = deferred()
+    const faulted = deferred()
+    const itemReceipt = receipt()
+    let callbackPending = false
+    let observedRejection = false
+    const worker = new HistorySyncBoundaryWorker(
+        { ...LIMITS, maxConcurrentBatches: 1, timeoutMs: 10_000 },
+        async (_input, signal, _currentReceipt, lifecycle) => {
+            assert.equal(lifecycle.onStart(), true)
+            callbackPending = true
+            // Attach both handlers now: a late application rejection is observed
+            // without keeping a worker-owned retired-callback collection.
+            void appCallback.then(
+                () => {
+                    callbackPending = false
+                    lifecycle.onSettled()
+                    callbackSettled.resolve()
+                },
+                () => {
+                    observedRejection = true
+                    callbackPending = false
+                    lifecycle.onSettled()
+                    callbackSettled.resolve()
+                }
+            )
+            callbackStarted.resolve()
+            await new Promise<void>((_resolve, reject) => {
+                signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+            })
+        },
+        () => undefined,
+        (reason) => {
+            assert.equal(reason, 'callback_cancelled')
+            faulted.resolve()
+        }
+    )
+    worker.enqueue(notification(), itemReceipt.value, () => undefined)
+    await callbackStarted.promise
+    const shutdown = worker.cancelAndDrain()
+    await faulted.promise
+    await shutdown
+    assert.equal(worker.getStatus(), 'FAULTED')
+    assert.equal(callbackPending, true)
+    assert.equal(worker.running(), 0)
+    assert.deepEqual(itemReceipt.state, ['fail'])
+
+    rejectCallback(new Error('private late callback failure'))
+    await callbackSettled.promise
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.equal(observedRejection, true)
+    assert.equal(worker.getStatus(), 'FAULTED')
+    assert.deepEqual(itemReceipt.state, ['fail'])
+})
+
+test('one timed-out callback faults all active history work and bounds unresolved callbacks by concurrency', async () => {
+    const callbacks = [deferred(), deferred()]
+    const bothStarted = deferred()
+    const faulted = deferred()
+    const receipts = [receipt(), receipt(), receipt(), receipt()]
+    const keepAlive = setTimeout(() => undefined, 1_000)
+    let starts = 0
+    let unresolvedCallbacks = 0
+    const worker = new HistorySyncBoundaryWorker(
+        { ...LIMITS, maxConcurrentBatches: 2, maxQueuedBatches: 2, timeoutMs: 20 },
+        async (_input, signal, _currentReceipt, lifecycle) => {
+            const index = starts++
+            assert.equal(lifecycle.onStart(), true)
+            unresolvedCallbacks += 1
+            void callbacks[index].promise.then(() => {
+                unresolvedCallbacks -= 1
+                lifecycle.onSettled()
+            })
+            if (starts === 2) bothStarted.resolve()
+            await new Promise<void>((_resolve, reject) => {
+                signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+            })
+        },
+        () => undefined,
+        (reason) => {
+            assert.equal(reason, 'callback_timeout')
+            faulted.resolve()
+        }
+    )
+    worker.enqueue(notification(), receipts[0].value, () => undefined)
+    worker.enqueue(notification(), receipts[1].value, () => undefined)
+    worker.enqueue(notification(), receipts[2].value, () => undefined)
+    await bothStarted.promise
+    await faulted.promise
+    clearTimeout(keepAlive)
+    await worker.cancelAndDrain()
+    assert.equal(worker.getStatus(), 'FAULTED')
+    assert.equal(worker.running(), 0)
+    assert.equal(unresolvedCallbacks, 2)
+    assert.ok(
+        unresolvedCallbacks <= 2,
+        'unresolved callback count is bounded by pre-fault concurrency'
+    )
+
+    assert.equal(
+        worker.enqueue(notification(), receipts[3].value, () => undefined),
+        false
+    )
+    assert.equal(starts, 2)
+    assert.deepEqual(
+        receipts.map((entry) => entry.state),
+        [['fail'], ['fail'], ['fail'], ['fail']]
+    )
+
+    callbacks[0].resolve()
+    callbacks[1].resolve()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.equal(unresolvedCallbacks, 0)
+    assert.equal(worker.getStatus(), 'FAULTED')
 })
 
 test('history worker callback rejection fails closed without receipt completion', async () => {

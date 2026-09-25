@@ -1060,6 +1060,17 @@ test('WaClient exposes chat/group/privacy coordinator getters', () => {
     assert.equal(getCoordinatorGetterMethod('privacy').call(fakeClient), privacyCoordinator)
 })
 
+test('WaClient reports disabled and terminal history-boundary state', () => {
+    const getState = WaClient.prototype.getHistorySyncBoundaryState
+    const disabledClient = { historyBoundaryWorker: null }
+    assert.equal(getState.call(disabledClient as never), 'DISABLED')
+
+    const faultedClient = {
+        historyBoundaryWorker: { getStatus: () => 'FAULTED' as const }
+    }
+    assert.equal(getState.call(faultedClient as never), 'FAULTED')
+})
+
 test('clearStoredState respects logoutStoreClear domain toggles', async () => {
     const { fakeClient, cleared } = createClearStoredStateHarness({
         auth: false,

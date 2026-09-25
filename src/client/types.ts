@@ -354,7 +354,11 @@ export interface WaHistorySyncOptions {
      * history notification is decoded on an isolated bounded worker and its
      * ordinary delivery receipt is withheld until this callback fulfills.
      * Fulfillment must mean the complete batch has been durably accepted by
-     * the application. The callback does not control protocol receipts.
+     * the application. The callback does not control protocol receipts. It
+     * must cooperate with `signal`: an unresolved callback at timeout or
+     * cancellation permanently faults history for this client instance.
+     * Late callback side effects may still finish, but cannot authorize a
+     * receipt; the application should make durable acceptance idempotent.
      */
     readonly onBatch?: WaHistorySyncBatchHandler
     /** Required with `onBatch`; every value is caller-selected, finite, and has no library default. */
@@ -442,7 +446,21 @@ export interface WaHistorySyncBatchContext {
 
 /** Sanitized result when a durable-history boundary item cannot be accepted. */
 export interface WaHistorySyncBoundaryFailureEvent {
-    readonly reason: 'queue_full' | 'processing_failed' | 'timeout' | 'cancelled'
+    readonly reason: 'queue_full' | 'processing_failed' | 'timeout' | 'cancelled' | 'faulted'
+}
+
+/** Current state of this client instance's optional durable-history boundary.
+ * A terminal fault is not reset by reconnect; clean recovery requires a process restart.
+ */
+export type WaHistorySyncBoundaryState = 'DISABLED' | 'AVAILABLE' | 'FAULTED'
+
+/** Privacy-safe reason category for the terminal history-boundary fault. */
+export type WaHistorySyncBoundaryFaultReason = 'callback_timeout' | 'callback_cancelled'
+
+/** Emitted once when unresolved application callback work terminally faults history sync. */
+export interface WaHistorySyncBoundaryFaultEvent {
+    readonly state: 'FAULTED'
+    readonly reason: WaHistorySyncBoundaryFaultReason
 }
 
 export type WaHistorySyncBatchHandler = (
@@ -1678,6 +1696,8 @@ export interface WaClientEventMap {
     readonly history_sync_chunk: (event: WaHistorySyncChunkEvent) => void
     /** Fail-closed durable-history boundary outcome; contains no source identifiers or payload. */
     readonly history_sync_boundary_failure: (event: WaHistorySyncBoundaryFailureEvent) => void
+    /** Terminal, per-client history-subsystem fault; reconnect does not clear it. */
+    readonly history_sync_boundary_fault: (event: WaHistorySyncBoundaryFaultEvent) => void
     /**
      * A group-history bundle another member shared with this account after it
      * joined a group, already downloaded and persisted. Requires
