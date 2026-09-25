@@ -48,6 +48,13 @@ export class HistorySyncBoundaryWorker {
         receipt: WaDeferredHistoryReceipt,
         onSettled: () => void
     ): boolean {
+        if (hasUnsupportedUnknownFields(notification)) {
+            receipt.fail()
+            onSettled()
+            this.onFailure('processing_failed')
+            return false
+        }
+
         const retainedBytes = estimateRetainedBytes(notification)
         const sourceBytes = readDeclaredLength(notification)
         if (
@@ -191,10 +198,36 @@ function estimateRetainedBytes(
     }
     add(notification.initialHistBootstrapInlinePayload)
     add(notification.directPath)
+    add(notification.originalMessageId)
+    add(notification.peerDataRequestSessionId)
+    add(notification.encHandle)
     add(notification.mediaKey)
     add(notification.fileSha256)
     add(notification.fileEncSha256)
+    const onDemandMetadata = notification.fullHistorySyncOnDemandRequestMetadata
+    add(onDemandMetadata?.requestId)
+    add(onDemandMetadata?.businessProduct)
+    add(onDemandMetadata?.opaqueClientData)
     return Number.isSafeInteger(size) ? size : null
+}
+
+type ProtoMessageWithUnknownFields =
+    | { readonly $unknowns?: readonly Uint8Array[] | null }
+    | null
+    | undefined
+
+function hasUnknownFields(message: ProtoMessageWithUnknownFields): boolean {
+    return Boolean(message?.$unknowns?.length)
+}
+
+function hasUnsupportedUnknownFields(
+    notification: Proto.Message.IHistorySyncNotification
+): boolean {
+    return (
+        hasUnknownFields(notification) ||
+        hasUnknownFields(notification.fullHistorySyncOnDemandRequestMetadata) ||
+        hasUnknownFields(notification.messageAccessStatus)
+    )
 }
 
 function readDeclaredLength(notification: Proto.Message.IHistorySyncNotification): number | null {
