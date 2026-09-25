@@ -816,6 +816,13 @@ function captureBoundaryMessage(
             boundary.blockedReason ??= 'direct_message_content_unclassified'
             return
         }
+        if (
+            contentType === 'extendedTextMessage' &&
+            message.message.extendedTextMessage?.$unknowns?.length
+        ) {
+            boundary.blockedReason ??= 'unknown_extended_text_fields'
+            return
+        }
         if (contentType === 'conversation' && typeof message.message.conversation === 'string') {
             content = { kind: 'TEXT', text: message.message.conversation }
         } else if (

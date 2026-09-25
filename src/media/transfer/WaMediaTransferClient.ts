@@ -502,9 +502,11 @@ export class WaMediaTransferClient {
         for (let index = 0; index < urls.length; index += 1) {
             const url = urls[index]
             const abort = this.createAbortContext(timeoutMs, signal)
+            let bodyLifetime: Promise<void> | null = null
             try {
                 const response = await send(url, abort.signal)
                 const shouldFallback = response.status >= 500 && index < urls.length - 1
+                bodyLifetime = this.monitorResponseBody(response.body, abort)
                 if (!shouldFallback) {
                     return {
                         url,
@@ -514,12 +516,24 @@ export class WaMediaTransferClient {
                         body: response.body
                     }
                 }
-                await response.cancel()
+                try {
+                    await response.cancel()
+                } catch (error) {
+                    if (response.body && !response.body.destroyed) {
+                        response.body.destroy(toError(error))
+                    }
+                    await bodyLifetime
+                    throw error
+                }
+                await bodyLifetime
                 this.logger?.warn('transfer fallback to next host', {
                     url,
                     status: response.status
                 })
             } catch (error) {
+                if (!bodyLifetime) {
+                    abort.cleanup()
+                }
                 const normalized = toError(error)
                 lastError = normalized
                 if (abort.signal.aborted && signal?.aborted) {
@@ -532,8 +546,6 @@ export class WaMediaTransferClient {
                     url,
                     message: normalized.message
                 })
-            } finally {
-                abort.cleanup()
             }
         }
 
@@ -572,6 +584,52 @@ export class WaMediaTransferClient {
                 }
             }
         }
+    }
+
+    /** Keeps the request timeout and caller signal attached through body completion. */
+    private monitorResponseBody(
+        body: Readable | null,
+        abort: { readonly signal: AbortSignal; cleanup(): void }
+    ): Promise<void> {
+        if (!body) {
+            abort.cleanup()
+            return Promise.resolve()
+        }
+
+        return new Promise<void>((resolve) => {
+            let settled = false
+            const finish = (): void => {
+                if (settled) return
+                settled = true
+                body.removeListener('end', finish)
+                body.removeListener('close', finish)
+                body.removeListener('error', finish)
+                abort.signal.removeEventListener('abort', onAbort)
+                abort.cleanup()
+                resolve()
+            }
+            const onAbort = (): void => {
+                if (!body.destroyed) {
+                    const reason = abort.signal.reason
+                    body.destroy(
+                        reason instanceof Error ? reason : new Error('media transfer was aborted')
+                    )
+                }
+            }
+
+            // The error listener also prevents a destroy(error) between headers
+            // and the caller attaching its stream consumer from becoming unhandled.
+            body.once('end', finish)
+            body.once('close', finish)
+            body.once('error', finish)
+            abort.signal.addEventListener('abort', onAbort, { once: true })
+
+            if (body.destroyed || body.readableEnded) {
+                finish()
+            } else if (abort.signal.aborted) {
+                onAbort()
+            }
+        })
     }
 
     private async drainBody(body: Readable | null): Promise<void> {

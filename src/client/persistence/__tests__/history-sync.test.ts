@@ -22,6 +22,65 @@ import { readProtoVarint } from '@util/protoscan'
 
 const gzipAsync = promisify(gzip)
 
+function encodeVarint(value: number): Uint8Array {
+    const bytes: number[] = []
+    let remaining = value
+    while (remaining > 0x7f) {
+        bytes.push((remaining & 0x7f) | 0x80)
+        remaining = Math.floor(remaining / 128)
+    }
+    bytes.push(remaining)
+    return Uint8Array.from(bytes)
+}
+
+function concatenate(...parts: readonly Uint8Array[]): Uint8Array {
+    const result = new Uint8Array(parts.reduce((total, part) => total + part.byteLength, 0))
+    let offset = 0
+    for (const part of parts) {
+        result.set(part, offset)
+        offset += part.byteLength
+    }
+    return result
+}
+
+function encodeBytesField(fieldNumber: number, value: Uint8Array): Uint8Array {
+    return concatenate(encodeVarint(fieldNumber * 8 + 2), encodeVarint(value.byteLength), value)
+}
+
+function encodeStringField(fieldNumber: number, value: string): Uint8Array {
+    return encodeBytesField(fieldNumber, new TextEncoder().encode(value))
+}
+
+function encodeVarintField(fieldNumber: number, value: number): Uint8Array {
+    return concatenate(encodeVarint(fieldNumber * 8), encodeVarint(value))
+}
+
+function buildHistoryWithExtendedTextUnknown(): Uint8Array {
+    const unknownField99 = encodeVarintField(99, 1)
+    const address = '5511000000001@s.whatsapp.net'
+    const extendedText = concatenate(encodeStringField(1, 'visible text'), unknownField99)
+    const message = encodeBytesField(6, extendedText)
+    const key = concatenate(
+        encodeStringField(1, address),
+        encodeVarintField(2, 0),
+        encodeStringField(3, 'msg-1')
+    )
+    const webMessage = concatenate(
+        encodeBytesField(1, key),
+        encodeBytesField(2, message),
+        encodeVarintField(3, 1_700_000_000)
+    )
+    const historyMessage = encodeBytesField(1, webMessage)
+    const conversation = concatenate(
+        encodeStringField(1, address),
+        encodeBytesField(2, historyMessage)
+    )
+    return concatenate(
+        encodeVarintField(1, proto.HistorySync.HistorySyncType.RECENT),
+        encodeBytesField(2, conversation)
+    )
+}
+
 /**
  * Reads a field number back out of the generated encoder: encode a message
  * carrying only that field, then decode the leading tag. Keeps the hardcoded
@@ -364,6 +423,46 @@ test('history boundary rejects unknown notification fields before callback and r
     )
     assert.equal(callbackCalled, false)
     assert.deepEqual(capture.acked, [])
+})
+
+test('history boundary rejects visible extended text when its consumed protobuf node has unknown fields', async () => {
+    const { capture, deps } = createCapture()
+    const rawPayload = buildHistoryWithExtendedTextUnknown()
+    const decoded = proto.HistorySync.decode(rawPayload)
+    const nestedUnknowns =
+        decoded.conversations?.[0]?.messages?.[0]?.message?.message?.extendedTextMessage?.$unknowns
+    assert.equal(nestedUnknowns?.length, 1, 'synthetic field 99 must decode on ExtendedTextMessage')
+
+    let callbackCalled = false
+    const notification: proto.Message.IHistorySyncNotification = {
+        syncType: proto.Message.HistorySyncType.RECENT,
+        initialHistBootstrapInlinePayload: toBytesView(await gzipAsync(rawPayload))
+    }
+    await assert.rejects(
+        () =>
+            processHistorySyncNotification(deps as never, notification, {
+                limits: {
+                    maxConcurrentBatches: 1,
+                    maxQueuedBatches: 0,
+                    maxQueuedBytes: 0,
+                    maxBatchBytes: 16_384,
+                    maxMessagesPerBatch: 8,
+                    maxSourceRecordsPerBatch: 64,
+                    timeoutMs: 1_000
+                },
+                signal: new AbortController().signal,
+                onBatch: async () => {
+                    callbackCalled = true
+                }
+            }),
+        /unknown_extended_text_fields/
+    )
+
+    assert.equal(callbackCalled, false)
+    assert.deepEqual(capture.messages, [], 'lossy observation must not reach mailbox writes')
+    assert.deepEqual(capture.acked, [], 'failed boundary data must not be ordinary-acked')
+    assert.equal(JSON.stringify(capture.events).includes('unknown'), false)
+    assert.equal(JSON.stringify(capture.events).includes('visible text'), false)
 })
 
 test('history sync keeps an already-seconds Conversation timestamp untouched', async () => {

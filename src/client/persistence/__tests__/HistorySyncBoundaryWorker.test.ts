@@ -1,8 +1,13 @@
 import assert from 'node:assert/strict'
+import { createServer, type Server } from 'node:http'
+import type { Readable } from 'node:stream'
 import test from 'node:test'
+import { gzipSync } from 'node:zlib'
 
+import { processHistorySyncNotification } from '@client/persistence/history-sync'
 import { HistorySyncBoundaryWorker } from '@client/persistence/HistorySyncBoundaryWorker'
 import { createNoopLogger } from '@infra/log/types'
+import { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import {
     handleIncomingMessageAck,
     type WaDeferredHistoryReceipt
@@ -52,6 +57,75 @@ function deferred(): { readonly promise: Promise<void>; readonly resolve: () => 
         resolve = done
     })
     return { promise, resolve }
+}
+
+function wireVarint(value: number): Uint8Array {
+    const bytes: number[] = []
+    let remaining = value
+    while (remaining > 0x7f) {
+        bytes.push((remaining & 0x7f) | 0x80)
+        remaining = Math.floor(remaining / 128)
+    }
+    bytes.push(remaining)
+    return Uint8Array.from(bytes)
+}
+
+function wireConcat(...parts: readonly Uint8Array[]): Uint8Array {
+    const result = new Uint8Array(parts.reduce((total, part) => total + part.byteLength, 0))
+    let offset = 0
+    for (const part of parts) {
+        result.set(part, offset)
+        offset += part.byteLength
+    }
+    return result
+}
+
+function wireBytes(fieldNumber: number, value: Uint8Array): Uint8Array {
+    return wireConcat(wireVarint(fieldNumber * 8 + 2), wireVarint(value.byteLength), value)
+}
+
+function wireString(fieldNumber: number, value: string): Uint8Array {
+    return wireBytes(fieldNumber, new TextEncoder().encode(value))
+}
+
+function wireInteger(fieldNumber: number, value: number): Uint8Array {
+    return wireConcat(wireVarint(fieldNumber * 8), wireVarint(value))
+}
+
+function historyBytesWithExtendedTextUnknown(): Uint8Array {
+    const address = '5511000000001@s.whatsapp.net'
+    const extendedText = wireConcat(wireString(1, 'visible text'), wireInteger(99, 1))
+    const message = wireBytes(6, extendedText)
+    const key = wireConcat(wireString(1, address), wireInteger(2, 0), wireString(3, 'msg-1'))
+    const webMessage = wireConcat(
+        wireBytes(1, key),
+        wireBytes(2, message),
+        wireInteger(3, 1_700_000_000)
+    )
+    const historyMessage = wireBytes(1, webMessage)
+    const conversation = wireConcat(wireString(1, address), wireBytes(2, historyMessage))
+    return wireConcat(
+        wireInteger(1, proto.HistorySync.HistorySyncType.RECENT),
+        wireBytes(2, conversation)
+    )
+}
+
+async function listen(server: Server): Promise<string> {
+    await new Promise<void>((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(0, '127.0.0.1', resolve)
+    })
+    const address = server.address()
+    assert.ok(address && typeof address !== 'string')
+    return `http://127.0.0.1:${address.port}/history`
+}
+
+async function close(server: Server): Promise<void> {
+    if (!server.listening) return
+    server.closeAllConnections()
+    await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()))
+    })
 }
 
 test('history worker bounds jobs while the normal incoming handler completes beside a blocked callback', async () => {
@@ -173,11 +247,17 @@ test('history worker timeout aborts a never-resolving callback and never complet
     const started = deferred()
     const timedOut = deferred()
     const settled = deferred()
+    const releaseLateCallback = deferred()
+    const lateCallbackSettled = deferred()
     const keepAlive = setTimeout(() => undefined, 1_000)
     const itemReceipt = receipt()
     const worker = new HistorySyncBoundaryWorker(
         { ...LIMITS, maxQueuedBatches: 0, maxQueuedBytes: 0, timeoutMs: 15 },
-        async (_input, signal) => {
+        async (_input, signal, currentReceipt) => {
+            void releaseLateCallback.promise.then(() => {
+                currentReceipt.complete()
+                lateCallbackSettled.resolve()
+            })
             started.resolve()
             await new Promise<void>((_resolve, reject) => {
                 signal.addEventListener('abort', () => reject(signal.reason), { once: true })
@@ -193,6 +273,8 @@ test('history worker timeout aborts a never-resolving callback and never complet
     await timedOut.promise
     await settled.promise
     clearTimeout(keepAlive)
+    releaseLateCallback.resolve()
+    await lateCallbackSettled.promise
     assert.deepEqual(itemReceipt.state, ['fail'])
     assert.equal(worker.running(), 0)
 })
@@ -232,6 +314,155 @@ test('history worker rejects oversized and over-capacity jobs without admission'
     )
     assert.deepEqual(first.state, ['fail'])
     assert.deepEqual(failures, ['processing_failed'])
+})
+
+test('history worker applies the per-job retained-byte bound before active or queued admission', async () => {
+    const oversize = { ...notification(), directPath: 'x'.repeat(4_096) }
+    const activeReceipt = receipt()
+    const activeStarted = deferred()
+    const failures: string[] = []
+    const worker = new HistorySyncBoundaryWorker(
+        {
+            ...LIMITS,
+            maxConcurrentBatches: 1,
+            maxQueuedBatches: 1,
+            maxQueuedBytes: 8_192,
+            maxBatchBytes: 512
+        },
+        async (_input, signal) => {
+            activeStarted.resolve()
+            await new Promise<void>((resolve, reject) => {
+                signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+            })
+        },
+        (reason) => failures.push(reason)
+    )
+
+    assert.equal(
+        worker.enqueue(notification(), activeReceipt.value, () => undefined),
+        true
+    )
+    await activeStarted.promise
+
+    const occupiedSlotReceipt = receipt()
+    assert.equal(
+        worker.enqueue(oversize, occupiedSlotReceipt.value, () => undefined),
+        false,
+        'an occupied active slot must not turn an individually oversized item into a queue candidate'
+    )
+    assert.equal(worker.running(), 1)
+    assert.equal(worker.queued(), 0)
+    assert.deepEqual(occupiedSlotReceipt.state, ['fail'])
+
+    const immediateWorker = new HistorySyncBoundaryWorker(
+        {
+            ...LIMITS,
+            maxConcurrentBatches: 1,
+            maxQueuedBatches: 0,
+            maxQueuedBytes: 0,
+            maxBatchBytes: 512
+        },
+        async () => assert.fail('oversized immediately-active work must not start'),
+        (reason) => failures.push(reason)
+    )
+    const immediateReceipt = receipt()
+    assert.equal(
+        immediateWorker.enqueue(oversize, immediateReceipt.value, () => undefined),
+        false
+    )
+    assert.equal(immediateWorker.running(), 0)
+    assert.equal(immediateWorker.queued(), 0)
+    assert.deepEqual(immediateReceipt.state, ['fail'])
+    assert.deepEqual(failures, ['processing_failed', 'processing_failed'])
+
+    await worker.cancelAndDrain()
+    assert.equal(worker.running(), 0)
+    assert.equal(worker.queued(), 0)
+})
+
+test('history worker accepts the exact per-job byte boundary and enforces aggregate queued bytes separately', async () => {
+    const exactReceipt = receipt()
+    const exactSettled = deferred()
+    const exactWorker = new HistorySyncBoundaryWorker(
+        {
+            ...LIMITS,
+            maxConcurrentBatches: 1,
+            maxQueuedBatches: 0,
+            maxQueuedBytes: 0,
+            maxBatchBytes: 512
+        },
+        async (_input, currentSignal, currentReceipt) => {
+            assert.equal(currentSignal.aborted, false)
+            currentReceipt.complete()
+        },
+        () => assert.fail('the exact retained-byte boundary must be admitted')
+    )
+    const exactBoundary = { ...notification(), directPath: 'x'.repeat(128) }
+    assert.equal(
+        exactWorker.enqueue(exactBoundary, exactReceipt.value, () => exactSettled.resolve()),
+        true
+    )
+    await exactSettled.promise
+    assert.deepEqual(exactReceipt.state, ['complete'])
+
+    const activeStarted = deferred()
+    const queuedFailures: string[] = []
+    const aggregateWorker = new HistorySyncBoundaryWorker(
+        {
+            ...LIMITS,
+            maxConcurrentBatches: 1,
+            maxQueuedBatches: 2,
+            maxQueuedBytes: 512,
+            maxBatchBytes: 512
+        },
+        async (_input, signal) => {
+            activeStarted.resolve()
+            await new Promise<void>((resolve, reject) => {
+                signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+            })
+        },
+        (reason) => queuedFailures.push(reason)
+    )
+    const receipts = [receipt(), receipt(), receipt()]
+    assert.equal(
+        aggregateWorker.enqueue(notification(), receipts[0].value, () => undefined),
+        true
+    )
+    await activeStarted.promise
+    assert.equal(
+        aggregateWorker.enqueue(exactBoundary, receipts[1].value, () => undefined),
+        true,
+        'one 512-byte retained job fits the aggregate queued-byte budget exactly'
+    )
+    assert.equal(aggregateWorker.queued(), 1)
+    assert.equal(
+        aggregateWorker.enqueue(notification(), receipts[2].value, () => undefined),
+        false,
+        'the aggregate queued-byte budget is distinct from the per-job bound'
+    )
+    assert.equal(aggregateWorker.running(), 1)
+    assert.equal(aggregateWorker.queued(), 1)
+    assert.deepEqual(receipts[2].state, ['fail'])
+    assert.deepEqual(queuedFailures, ['queue_full'])
+    await aggregateWorker.cancelAndDrain()
+})
+
+test('history worker rejects unknowns on consumed notification envelope wrappers', () => {
+    const itemReceipt = receipt()
+    const failures: string[] = []
+    const worker = new HistorySyncBoundaryWorker(
+        LIMITS,
+        async () => assert.fail('unsupported wrapper unknowns must not be processed'),
+        (reason) => failures.push(reason)
+    )
+    assert.equal(
+        worker.enqueue(notification(), itemReceipt.value, () => undefined, true),
+        false
+    )
+    assert.deepEqual(itemReceipt.state, ['fail'])
+    assert.deepEqual(failures, ['processing_failed'])
+    assert.equal(worker.running(), 0)
+    assert.equal(worker.queued(), 0)
 })
 
 test('unknown notification bytes fail before queue admission and keep receipts withheld', async () => {
@@ -376,6 +607,290 @@ test('history worker rejects nested unknown fields before retention', () => {
         assert.equal(worker.queued(), 0)
         assert.deepEqual(itemReceipt.state, ['fail'])
         assert.deepEqual(failures, ['processing_failed'])
+    }
+})
+
+test('visible ExtendedTextMessage unknowns fail closed through the receipt gate', async () => {
+    const payload = historyBytesWithExtendedTextUnknown()
+    const decoded = proto.HistorySync.decode(payload)
+    assert.equal(
+        decoded.conversations?.[0]?.messages?.[0]?.message?.message?.extendedTextMessage?.$unknowns
+            ?.length,
+        1
+    )
+    const notificationValue: Proto.Message.IHistorySyncNotification = {
+        syncType: proto.Message.HistorySyncType.RECENT,
+        fileLength: 1,
+        initialHistBootstrapInlinePayload: gzipSync(payload)
+    }
+    const incomingMessage: Proto.IMessage = {
+        protocolMessage: {
+            type: proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+            historySyncNotification: notificationValue
+        }
+    }
+    const encoded = proto.Message.encode(incomingMessage).finish()
+    const padded = new Uint8Array(encoded.byteLength + 1)
+    padded.set(encoded)
+    padded[padded.byteLength - 1] = 1
+
+    const failures: string[] = []
+    const settled = deferred()
+    const sent: string[] = []
+    let callbackCalled = false
+    let historyReceipt: WaDeferredHistoryReceipt | undefined
+    const worker = new HistorySyncBoundaryWorker(
+        { ...LIMITS, maxBatchBytes: 16_384, maxQueuedBytes: 16_384 },
+        async (input, signal, currentReceipt) =>
+            processHistorySyncNotification(
+                {
+                    logger: createNoopLogger(),
+                    mediaTransfer: {} as never,
+                    writeBehind: {
+                        persistMessageAsync: async () => undefined,
+                        persistThreadAsync: async () => undefined,
+                        persistContactAsync: async () => undefined
+                    } as never,
+                    emitEvent: () => undefined,
+                    onProcessed: async () => assert.fail('failed batch must not be acknowledged')
+                } as never,
+                input,
+                {
+                    limits: {
+                        ...LIMITS,
+                        maxBatchBytes: 16_384,
+                        maxQueuedBytes: 16_384
+                    },
+                    signal,
+                    onBatch: async () => {
+                        callbackCalled = true
+                        currentReceipt.complete()
+                    }
+                }
+            ),
+        (reason) => failures.push(reason)
+    )
+    const handled = await handleIncomingMessageAck(
+        {
+            tag: 'message',
+            attrs: { id: 'history-extended-text-unknown', from: '5511000000001@s.whatsapp.net' },
+            content: [{ tag: 'enc', attrs: { type: 'msg' }, content: new Uint8Array([1]) }]
+        },
+        {
+            logger: createNoopLogger(),
+            sendNode: async (node) => {
+                sent.push(node.tag + ':' + (node.attrs.type ?? 'delivery'))
+            },
+            captureBoundSendNode: () => async (node) => {
+                sent.push(node.tag + ':' + (node.attrs.type ?? 'delivery'))
+            },
+            signalProtocol: { decryptMessage: async () => padded } as never,
+            scheduleHistorySync: (event, receiptValue) => {
+                historyReceipt = receiptValue
+                const input = event.message?.protocolMessage?.historySyncNotification
+                assert.ok(input)
+                return worker.enqueue(input, receiptValue, () => settled.resolve())
+            }
+        }
+    )
+
+    assert.equal(handled, true)
+    await settled.promise
+    assert.equal(callbackCalled, false)
+    assert.deepEqual(failures, ['processing_failed'])
+    assert.equal(JSON.stringify(failures).includes('visible text'), false)
+    assert.ok(historyReceipt)
+    await historyReceipt.sendHistorySyncReceipt()
+    assert.deepEqual(sent, [], 'neither ordinary nor hist_sync receipt may escape')
+})
+
+test('reconnect after history decode permanently stales the deferred receipt sender', async () => {
+    const historyPayload = proto.HistorySync.encode({
+        syncType: proto.HistorySync.HistorySyncType.RECENT,
+        conversations: []
+    }).finish()
+    const notificationValue: Proto.Message.IHistorySyncNotification = {
+        syncType: proto.Message.HistorySyncType.RECENT,
+        fileLength: 1,
+        initialHistBootstrapInlinePayload: gzipSync(historyPayload)
+    }
+    const message: Proto.IMessage = {
+        protocolMessage: {
+            type: proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+            historySyncNotification: notificationValue
+        }
+    }
+    const encoded = proto.Message.encode(message).finish()
+    const padded = new Uint8Array(encoded.byteLength + 1)
+    padded.set(encoded)
+    padded[padded.byteLength - 1] = 1
+
+    const callbackEntered = deferred()
+    const releaseCallback = deferred()
+    const jobSettled = deferred()
+    const sent: string[] = []
+    const failures: string[] = []
+    let generation = 2
+    let historyReceipt: WaDeferredHistoryReceipt | undefined
+    const worker = new HistorySyncBoundaryWorker(
+        { ...LIMITS, maxBatchBytes: 16_384, maxQueuedBytes: 16_384 },
+        async (input, signal, currentReceipt) =>
+            processHistorySyncNotification(
+                {
+                    logger: createNoopLogger(),
+                    mediaTransfer: {} as never,
+                    writeBehind: {
+                        persistMessageAsync: async () => undefined,
+                        persistThreadAsync: async () => undefined,
+                        persistContactAsync: async () => undefined
+                    } as never,
+                    emitEvent: () => undefined,
+                    onProcessed: async () => undefined
+                } as never,
+                input,
+                {
+                    limits: {
+                        ...LIMITS,
+                        maxBatchBytes: 16_384,
+                        maxQueuedBytes: 16_384
+                    },
+                    signal,
+                    onBatch: async () => {
+                        // onBatch is entered only after the inline history body
+                        // was fully decoded and its integrity gate completed.
+                        callbackEntered.resolve()
+                        await releaseCallback.promise
+                        currentReceipt.complete()
+                    }
+                }
+            ),
+        (reason) => failures.push(reason)
+    )
+
+    const handled = await handleIncomingMessageAck(
+        {
+            tag: 'message',
+            attrs: { id: 'history-reconnect-race', from: '5511000000001@s.whatsapp.net' },
+            content: [{ tag: 'enc', attrs: { type: 'msg' }, content: new Uint8Array([1]) }]
+        },
+        {
+            logger: createNoopLogger(),
+            sendNode: async (node) => {
+                sent.push(node.tag + ':' + (node.attrs.type ?? 'delivery'))
+            },
+            captureBoundSendNode: () => {
+                const capturedGeneration = generation
+                return async (node) => {
+                    if (capturedGeneration !== generation) {
+                        throw new Error('captured connection generation is stale')
+                    }
+                    sent.push(node.tag + ':' + (node.attrs.type ?? 'delivery'))
+                }
+            },
+            signalProtocol: { decryptMessage: async () => padded } as never,
+            scheduleHistorySync: (event, receiptValue) => {
+                historyReceipt = receiptValue
+                const input = event.message?.protocolMessage?.historySyncNotification
+                assert.ok(input)
+                return worker.enqueue(input, receiptValue, () => jobSettled.resolve())
+            }
+        }
+    )
+
+    assert.equal(handled, true)
+    await callbackEntered.promise
+    generation += 1 // replacement connection arrives after body decode, before adapter fulfillment
+    releaseCallback.resolve()
+    await jobSettled.promise
+
+    assert.deepEqual(failures, [])
+    assert.ok(historyReceipt)
+    await assert.rejects(historyReceipt.sendHistorySyncReceipt(), /generation is stale/)
+    assert.deepEqual(
+        sent,
+        [],
+        'late callback fulfillment must never route either receipt to the new connection'
+    )
+})
+
+test('abort after headers destroys stalled history body, drains the job, and withholds receipts', async () => {
+    const serverResponseClosed = deferred()
+    const server = createServer((_request, response) => {
+        response.once('close', serverResponseClosed.resolve)
+        response.writeHead(200)
+        response.flushHeaders()
+    })
+    const url = await listen(server)
+    const bodyReady = deferred()
+    const jobSettled = deferred()
+    const failures: string[] = []
+    const sent: string[] = []
+    const bodyReference: { value: Readable | null } = { value: null }
+    let historyReceipt: WaDeferredHistoryReceipt | undefined
+    const mediaTransfer = new WaMediaTransferClient()
+    const worker = new HistorySyncBoundaryWorker(
+        { ...LIMITS, timeoutMs: 5_000 },
+        async (_input, signal) => {
+            const response = await mediaTransfer.downloadStream({ url, signal, timeoutMs: 5_000 })
+            bodyReference.value = response.body
+            assert.ok(bodyReference.value)
+            bodyReady.resolve()
+            for await (const chunk of bodyReference.value) {
+                void chunk
+            }
+        },
+        (reason) => failures.push(reason)
+    )
+    const message: Proto.IMessage = {
+        protocolMessage: {
+            type: proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+            historySyncNotification: notification()
+        }
+    }
+    const encoded = proto.Message.encode(message).finish()
+    const padded = new Uint8Array(encoded.byteLength + 1)
+    padded.set(encoded)
+    padded[padded.byteLength - 1] = 1
+
+    try {
+        const handled = await handleIncomingMessageAck(
+            {
+                tag: 'message',
+                attrs: { id: 'history-stalled-body', from: '5511000000001@s.whatsapp.net' },
+                content: [{ tag: 'enc', attrs: { type: 'msg' }, content: new Uint8Array([1]) }]
+            },
+            {
+                logger: createNoopLogger(),
+                sendNode: async (node) => {
+                    sent.push(node.tag + ':' + (node.attrs.type ?? 'delivery'))
+                },
+                captureBoundSendNode: () => async (node) => {
+                    sent.push(node.tag + ':' + (node.attrs.type ?? 'delivery'))
+                },
+                signalProtocol: { decryptMessage: async () => padded } as never,
+                scheduleHistorySync: (event, receiptValue) => {
+                    historyReceipt = receiptValue
+                    const input = event.message?.protocolMessage?.historySyncNotification
+                    assert.ok(input)
+                    return worker.enqueue(input, receiptValue, () => jobSettled.resolve())
+                }
+            }
+        )
+        assert.equal(handled, true)
+        await bodyReady.promise
+        const receivedBody = bodyReference.value
+        assert.ok(receivedBody)
+        const bodyClosed = new Promise<void>((resolve) => receivedBody.once('close', resolve))
+        await worker.cancelAndDrain(new Error('test cancellation after response headers'))
+        await Promise.all([bodyClosed, serverResponseClosed.promise, jobSettled.promise])
+
+        assert.equal(receivedBody.destroyed, true)
+        assert.deepEqual(failures, ['cancelled'])
+        assert.ok(historyReceipt)
+        await historyReceipt.sendHistorySyncReceipt()
+        assert.deepEqual(sent, [], 'cancelled body transfer must not release either receipt')
+    } finally {
+        await close(server)
     }
 })
 

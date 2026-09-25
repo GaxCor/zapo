@@ -362,12 +362,19 @@ export interface WaHistorySyncOptions {
 }
 
 export interface WaHistorySyncBoundaryLimits {
+    /** Maximum jobs executing callbacks/transfers at once. */
     readonly maxConcurrentBatches: number
+    /** Maximum waiting jobs, independent of queued byte size. */
     readonly maxQueuedBatches: number
+    /** Aggregate retained-byte budget for waiting jobs only. */
     readonly maxQueuedBytes: number
+    /** Per-job retained-notification and declared encrypted-payload ceiling. */
     readonly maxBatchBytes: number
+    /** Maximum message observations retained for one job. */
     readonly maxMessagesPerBatch: number
+    /** Maximum source protobuf records inspected for one job. */
     readonly maxSourceRecordsPerBatch: number
+    /** Maximum processing/callback duration before abort is signalled. */
     readonly timeoutMs: number
 }
 

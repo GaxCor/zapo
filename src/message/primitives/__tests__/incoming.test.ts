@@ -142,6 +142,50 @@ test('history boundary withholds delivery receipt until callback capability comp
     assert.deepEqual(sent, ['receipt:delivery', 'receipt:hist_sync'])
 })
 
+test('history receipt captured before reconnect never sends after callback completion', async () => {
+    const sent: string[] = []
+    let generation = 4
+    let deferred: WaDeferredHistoryReceipt | undefined
+    const message: proto.IMessage = {
+        protocolMessage: {
+            type: proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+            historySyncNotification: { syncType: proto.Message.HistorySyncType.RECENT }
+        }
+    }
+    const handled = await handleIncomingMessageAck(createEncryptedMessageNode(), {
+        ...createDecryptingOptions([], { message }),
+        sendNode: async (node) => {
+            sent.push(node.tag + ':' + (node.attrs.type ?? 'delivery'))
+        },
+        captureBoundSendNode: () => {
+            const capturedGeneration = generation
+            return async (node) => {
+                if (capturedGeneration !== generation) {
+                    throw new Error('captured connection generation is stale')
+                }
+                sent.push(node.tag + ':' + (node.attrs.type ?? 'delivery'))
+            }
+        },
+        scheduleHistorySync: (_event, receipt) => {
+            deferred = receipt
+            return true
+        }
+    })
+
+    assert.equal(handled, true)
+    assert.ok(deferred)
+    generation += 1 // reconnect after decode, while callback work is still pending
+    deferred.complete()
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    assert.deepEqual(
+        sent,
+        [],
+        'late completion cannot send the old delivery receipt on a new connection'
+    )
+    await assert.rejects(deferred.sendHistorySyncReceipt(), /generation is stale/)
+    assert.deepEqual(sent, [], 'the distinct history receipt is also bound to the old generation')
+})
+
 test('history boundary failure suppresses ordinary and hist_sync receipts', async () => {
     const sent: string[] = []
     let deferred: WaDeferredHistoryReceipt | undefined

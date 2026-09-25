@@ -46,9 +46,10 @@ export class HistorySyncBoundaryWorker {
     public enqueue(
         notification: Proto.Message.IHistorySyncNotification,
         receipt: WaDeferredHistoryReceipt,
-        onSettled: () => void
+        onSettled: () => void,
+        hasUnsupportedEnvelopeUnknowns = false
     ): boolean {
-        if (hasUnsupportedUnknownFields(notification)) {
+        if (hasUnsupportedEnvelopeUnknowns || hasUnsupportedUnknownFields(notification)) {
             receipt.fail()
             onSettled()
             this.onFailure('processing_failed')
@@ -60,6 +61,10 @@ export class HistorySyncBoundaryWorker {
         if (
             retainedBytes === null ||
             sourceBytes === null ||
+            // maxBatchBytes is the per-job retained/source ceiling and applies
+            // before either active or queued admission. maxQueuedBytes below is
+            // a separate aggregate ceiling for queued jobs only.
+            retainedBytes > this.limits.maxBatchBytes ||
             sourceBytes > this.limits.maxBatchBytes ||
             (notification.initialHistBootstrapInlinePayload instanceof Uint8Array &&
                 notification.initialHistBootstrapInlinePayload.byteLength >

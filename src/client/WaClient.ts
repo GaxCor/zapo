@@ -463,8 +463,16 @@ class WaClientImpl extends EventEmitter {
             receipt.fail()
             return false
         }
-        return this.historyBoundaryWorker.enqueue(notification, receipt, () =>
-            this.leaveIncomingHandler()
+        const message = event.message
+        const protocolMessage = message?.protocolMessage
+        const hasUnsupportedEnvelopeUnknowns = Boolean(
+            message?.$unknowns?.length || protocolMessage?.$unknowns?.length
+        )
+        return this.historyBoundaryWorker.enqueue(
+            notification,
+            receipt,
+            () => this.leaveIncomingHandler(),
+            hasUnsupportedEnvelopeUnknowns
         )
     }
 

@@ -39,18 +39,23 @@ export class WaNodeTransport extends EventEmitter {
         await this.sendNodeThrough(comms, node)
     }
 
-    /** Captures the current comms so deferred protocol receipts cannot use a replacement connection. */
+    /** Captures current comms + Noise generation so deferred receipts cannot use a replacement session. */
     public captureBoundSender(): (node: BinaryNode) => Promise<void> {
         const comms = this.comms
+        const generation = comms?.getConnectionGeneration()
         return async (node: BinaryNode): Promise<void> => {
             if (!comms) {
                 throw new Error('comms was not connected when the sender was captured')
             }
-            await this.sendNodeThrough(comms, node)
+            await this.sendNodeThrough(comms, node, generation)
         }
     }
 
-    private async sendNodeThrough(comms: WaComms, node: BinaryNode): Promise<void> {
+    private async sendNodeThrough(
+        comms: WaComms,
+        node: BinaryNode,
+        generation?: number
+    ): Promise<void> {
         this.logger.trace('node transport send node', {
             tag: node.tag,
             id: node.attrs.id,
@@ -60,7 +65,11 @@ export class WaNodeTransport extends EventEmitter {
         const frame = encodeBinaryNodeStanza(node)
         this.emit('node_out', node, frame)
         this.emit('frame_out', frame)
-        await comms.sendFrame(frame)
+        if (generation === undefined) {
+            await comms.sendFrame(frame)
+        } else {
+            await comms.sendFrameForGeneration(frame, generation)
+        }
     }
 
     /**

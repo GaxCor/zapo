@@ -54,6 +54,7 @@ export class WaComms {
     private resumeHandshakeFailures: number
     private usedResumeHandshake: boolean
     private noiseSession: WaNoiseSession | null
+    private connectionGeneration: number
     private lastServerStaticKey: Uint8Array | null
     private lastInboundAtMs: number
     private frameProcessingQueue: Promise<void>
@@ -123,6 +124,7 @@ export class WaComms {
         this.resumeHandshakeFailures = 0
         this.usedResumeHandshake = false
         this.noiseSession = null
+        this.connectionGeneration = 0
         this.lastServerStaticKey = null
         this.lastInboundAtMs = 0
         this.frameProcessingQueue = Promise.resolve()
@@ -268,6 +270,27 @@ export class WaComms {
         await this.socket.send(wire)
     }
 
+    /** Sends only if the protocol session still matches a previously captured generation. */
+    public async sendFrameForGeneration(
+        payload: Uint8Array,
+        expectedGeneration: number
+    ): Promise<void> {
+        const session = this.noiseSession
+        if (!session || expectedGeneration !== this.connectionGeneration) {
+            throw new Error('captured connection generation is stale')
+        }
+        const wire = await session.encryptFrame(payload)
+        if (expectedGeneration !== this.connectionGeneration || this.noiseSession !== session) {
+            throw new Error('captured connection generation is stale')
+        }
+        await this.socket.send(wire)
+    }
+
+    /** Monotonic token for receipt senders bound to the current Noise authority. */
+    public getConnectionGeneration(): number {
+        return this.connectionGeneration
+    }
+
     /** Timestamp (`Date.now()` ms) of the last raw payload received from the socket; `0` before any inbound. */
     public getLastInboundAtMs(): number {
         return this.lastInboundAtMs
@@ -337,7 +360,7 @@ export class WaComms {
     private async onSocketClosed(info: SocketCloseInfo): Promise<void> {
         this.connected = false
         this.noiseSession?.onSocketClosed(new Error(`socket closed (${info.code}:${info.reason})`))
-        this.noiseSession = null
+        this.replaceNoiseSession(null)
         this.clearPendingFrames()
         this.pendingFramesOverflowClosing = false
         if (!this.started || this.preventRetry) {
@@ -416,7 +439,7 @@ export class WaComms {
         this.logger.debug('comms socket opened, starting noise session')
         const noiseConfig = this.buildNoiseConfigForAttempt()
         const session = new WaNoiseSession(async (wire) => this.socket.send(wire), this.logger)
-        this.noiseSession = session
+        this.replaceNoiseSession(session)
         try {
             await session.start(noiseConfig)
         } catch (error) {
@@ -430,7 +453,7 @@ export class WaComms {
                     }
                 )
             }
-            this.noiseSession = null
+            this.replaceNoiseSession(null)
             throw error
         }
         const buffered = await session.pushWireChunk(EMPTY_BYTES)
@@ -632,7 +655,7 @@ export class WaComms {
         if (options.resetResumeHandshakeFailures !== false) {
             this.resumeHandshakeFailures = 0
         }
-        this.noiseSession = null
+        this.replaceNoiseSession(null)
         this.lastInboundAtMs = 0
         this.clearPendingFrames()
         this.pendingFramesOverflowClosing = false
@@ -645,6 +668,11 @@ export class WaComms {
             const rejectWaitersError = options.rejectWaitersError
             this.drainWaiters((waiter) => waiter.reject(rejectWaitersError))
         }
+    }
+
+    private replaceNoiseSession(session: WaNoiseSession | null): void {
+        this.connectionGeneration += 1
+        this.noiseSession = session
     }
 
     private drainWaiters(drain: (waiter: ConnectionWaiter) => void): void {
