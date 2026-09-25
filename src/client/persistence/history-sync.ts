@@ -818,7 +818,7 @@ function captureBoundaryMessage(
         }
         if (
             contentType === 'extendedTextMessage' &&
-            message.message.extendedTextMessage?.$unknowns?.length
+            hasUnknownFieldsDeep(message.message.extendedTextMessage)
         ) {
             boundary.blockedReason ??= 'unknown_extended_text_fields'
             return
@@ -865,6 +865,22 @@ function captureBoundaryMessage(
         content
     }
     boundary.observations.push(observation)
+}
+
+function hasUnknownFieldsDeep(value: unknown, visited = new WeakSet<object>()): boolean {
+    if (value === null || typeof value !== 'object' || value instanceof Uint8Array) {
+        return false
+    }
+    if (visited.has(value)) return false
+    visited.add(value)
+
+    const message = value as { readonly $unknowns?: unknown }
+    if (Array.isArray(message.$unknowns) && message.$unknowns.length > 0) {
+        return true
+    }
+
+    const children = Array.isArray(value) ? value : Object.values(value)
+    return children.some((child) => hasUnknownFieldsDeep(child, visited))
 }
 
 function classifyHistoryChat(address: string): WaHistorySyncChatKind {

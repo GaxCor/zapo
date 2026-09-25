@@ -61,13 +61,20 @@ type SyntheticUnknownNode =
     | 'message_key'
     | 'message_container'
     | 'extended_text_message'
+    | 'extended_text_context_info'
 
 function buildHistoryWithUnknown(node: SyntheticUnknownNode): Uint8Array {
     const unknownField99 = encodeVarintField(99, 1)
     const address = '5511000000001@s.whatsapp.net'
+    const contextInfoField = encodedFieldNumber(proto.Message.ExtendedTextMessage, {
+        contextInfo: {}
+    })
     const extendedText = concatenate(
         encodeStringField(1, 'visible text'),
-        ...(node === 'extended_text_message' ? [unknownField99] : [])
+        ...(node === 'extended_text_message' ? [unknownField99] : []),
+        ...(node === 'extended_text_context_info'
+            ? [encodeBytesField(contextInfoField, unknownField99)]
+            : [])
     )
     const message = concatenate(
         encodeBytesField(6, extendedText),
@@ -481,6 +488,45 @@ test('history boundary rejects visible extended text when its consumed protobuf 
     assert.deepEqual(capture.acked, [], 'failed boundary data must not be ordinary-acked')
     assert.equal(JSON.stringify(capture.events).includes('unknown'), false)
     assert.equal(JSON.stringify(capture.events).includes('visible text'), false)
+})
+
+test('history boundary rejects unknown fields nested below extended-text metadata', async () => {
+    const rawPayload = buildHistoryWithUnknown('extended_text_context_info')
+    const decoded = proto.HistorySync.decode(rawPayload)
+    const nestedUnknowns =
+        decoded.conversations?.[0]?.messages?.[0]?.message?.message?.extendedTextMessage?.contextInfo
+            ?.$unknowns
+    assert.equal(nestedUnknowns?.length, 1, 'synthetic field 99 must decode on ContextInfo')
+
+    const { capture, deps } = createCapture()
+    const notification: proto.Message.IHistorySyncNotification = {
+        syncType: proto.Message.HistorySyncType.RECENT,
+        initialHistBootstrapInlinePayload: toBytesView(await gzipAsync(rawPayload))
+    }
+    let callbackCalled = false
+    await assert.rejects(
+        () =>
+            processHistorySyncNotification(deps as never, notification, {
+                limits: {
+                    maxConcurrentBatches: 1,
+                    maxQueuedBatches: 0,
+                    maxQueuedBytes: 0,
+                    maxBatchBytes: 16_384,
+                    maxMessagesPerBatch: 8,
+                    maxSourceRecordsPerBatch: 64,
+                    timeoutMs: 1_000
+                },
+                signal: new AbortController().signal,
+                onBatch: async () => {
+                    callbackCalled = true
+                }
+            }),
+        /unknown_extended_text_fields/
+    )
+
+    assert.equal(callbackCalled, false)
+    assert.deepEqual(capture.messages, [])
+    assert.deepEqual(capture.acked, [])
 })
 
 test('history boundary rejects unknown fields on every consumed message wrapper', async () => {
