@@ -55,22 +55,40 @@ function encodeVarintField(fieldNumber: number, value: number): Uint8Array {
     return concatenate(encodeVarint(fieldNumber * 8), encodeVarint(value))
 }
 
-function buildHistoryWithExtendedTextUnknown(): Uint8Array {
+type SyntheticUnknownNode =
+    | 'history_sync_msg'
+    | 'web_message_info'
+    | 'message_key'
+    | 'message_container'
+    | 'extended_text_message'
+
+function buildHistoryWithUnknown(node: SyntheticUnknownNode): Uint8Array {
     const unknownField99 = encodeVarintField(99, 1)
     const address = '5511000000001@s.whatsapp.net'
-    const extendedText = concatenate(encodeStringField(1, 'visible text'), unknownField99)
-    const message = encodeBytesField(6, extendedText)
+    const extendedText = concatenate(
+        encodeStringField(1, 'visible text'),
+        ...(node === 'extended_text_message' ? [unknownField99] : [])
+    )
+    const message = concatenate(
+        encodeBytesField(6, extendedText),
+        ...(node === 'message_container' ? [unknownField99] : [])
+    )
     const key = concatenate(
         encodeStringField(1, address),
         encodeVarintField(2, 0),
-        encodeStringField(3, 'msg-1')
+        encodeStringField(3, 'msg-1'),
+        ...(node === 'message_key' ? [unknownField99] : [])
     )
     const webMessage = concatenate(
         encodeBytesField(1, key),
         encodeBytesField(2, message),
-        encodeVarintField(3, 1_700_000_000)
+        encodeVarintField(3, 1_700_000_000),
+        ...(node === 'web_message_info' ? [unknownField99] : [])
     )
-    const historyMessage = encodeBytesField(1, webMessage)
+    const historyMessage = concatenate(
+        encodeBytesField(1, webMessage),
+        ...(node === 'history_sync_msg' ? [unknownField99] : [])
+    )
     const conversation = concatenate(
         encodeStringField(1, address),
         encodeBytesField(2, historyMessage)
@@ -427,7 +445,7 @@ test('history boundary rejects unknown notification fields before callback and r
 
 test('history boundary rejects visible extended text when its consumed protobuf node has unknown fields', async () => {
     const { capture, deps } = createCapture()
-    const rawPayload = buildHistoryWithExtendedTextUnknown()
+    const rawPayload = buildHistoryWithUnknown('extended_text_message')
     const decoded = proto.HistorySync.decode(rawPayload)
     const nestedUnknowns =
         decoded.conversations?.[0]?.messages?.[0]?.message?.message?.extendedTextMessage?.$unknowns
@@ -463,6 +481,51 @@ test('history boundary rejects visible extended text when its consumed protobuf 
     assert.deepEqual(capture.acked, [], 'failed boundary data must not be ordinary-acked')
     assert.equal(JSON.stringify(capture.events).includes('unknown'), false)
     assert.equal(JSON.stringify(capture.events).includes('visible text'), false)
+})
+
+test('history boundary rejects unknown fields on every consumed message wrapper', async () => {
+    const nodes: readonly SyntheticUnknownNode[] = [
+        'history_sync_msg',
+        'web_message_info',
+        'message_key',
+        'message_container'
+    ]
+
+    for (const node of nodes) {
+        const { capture, deps } = createCapture()
+        const rawPayload = buildHistoryWithUnknown(node)
+        const inlinePayload = toBytesView(await gzipAsync(rawPayload))
+        let callbackCalled = false
+        await assert.rejects(
+            () =>
+                processHistorySyncNotification(
+                    deps as never,
+                    {
+                        syncType: proto.Message.HistorySyncType.RECENT,
+                        initialHistBootstrapInlinePayload: inlinePayload
+                    },
+                    {
+                        limits: {
+                            maxConcurrentBatches: 1,
+                            maxQueuedBatches: 0,
+                            maxQueuedBytes: 0,
+                            maxBatchBytes: 16_384,
+                            maxMessagesPerBatch: 8,
+                            maxSourceRecordsPerBatch: 64,
+                            timeoutMs: 1_000
+                        },
+                        signal: new AbortController().signal,
+                        onBatch: async () => {
+                            callbackCalled = true
+                        }
+                    }
+                ),
+            /unknown/
+        )
+        assert.equal(callbackCalled, false, `${node} must fail before batch acceptance`)
+        assert.deepEqual(capture.messages, [], `${node} must not persist a lossy message`)
+        assert.deepEqual(capture.acked, [], `${node} must not acknowledge failed history`)
+    }
 })
 
 test('history sync keeps an already-seconds Conversation timestamp untouched', async () => {
