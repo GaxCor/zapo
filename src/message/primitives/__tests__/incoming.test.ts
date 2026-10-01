@@ -895,3 +895,99 @@ test('recipient_username wins over peer_recipient_username when both are present
 
     assert.equal(emitted[0].key.recipientUsername, 'primary')
 })
+
+test('history success is idempotent and a pre-success failure cannot resurrect either receipt', async () => {
+    for (const fails of [false, true]) {
+        const sent: string[] = []
+        let receipt: WaDeferredHistoryReceipt | undefined
+        const message: proto.IMessage = {
+            protocolMessage: {
+                type: proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+                historySyncNotification: { syncType: 3 }
+            }
+        }
+        await handleIncomingMessageAck(createEncryptedMessageNode(), {
+            ...createDecryptingOptions([], { message }),
+            sendNode: async (node) => {
+                sent.push(node.attrs.type ?? 'delivery')
+            },
+            captureBoundSendNode: () => async (node) => {
+                sent.push(node.attrs.type ?? 'delivery')
+            },
+            scheduleHistorySync: (_event, current) => {
+                receipt = current
+                return true
+            }
+        })
+        assert.ok(receipt)
+        await receipt.sendHistorySyncReceipt()
+        assert.deepEqual(sent, [])
+        if (fails) receipt.fail()
+        receipt.complete()
+        receipt.complete()
+        await new Promise<void>((done) => setImmediate(done))
+        await receipt.sendHistorySyncReceipt()
+        await receipt.sendHistorySyncReceipt()
+        assert.deepEqual(sent, fails ? [] : ['delivery', 'hist_sync'])
+    }
+})
+
+test('INT-02 multiple history batches share one stanza delivery gate; live stanzas stay independent', async () => {
+    for (const fails of [false, true]) {
+        const sent: string[] = []
+        const receipts: WaDeferredHistoryReceipt[] = []
+        const message: proto.IMessage = {
+            protocolMessage: {
+                type: proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+                historySyncNotification: { syncType: 3 }
+            }
+        }
+        const node = createEncryptedMessageNode()
+        assert.ok(Array.isArray(node.content))
+        const historyNode: BinaryNode = { ...node, content: [...node.content, ...node.content] }
+        await handleIncomingMessageAck(historyNode, {
+            ...createDecryptingOptions([], { message }),
+            sendNode: async (current) => {
+                sent.push(current.attrs.id + ':' + (current.attrs.type ?? 'delivery'))
+            },
+            captureBoundSendNode: () => async (current) => {
+                sent.push(current.attrs.id + ':' + (current.attrs.type ?? 'delivery'))
+            },
+            scheduleHistorySync: (_event, receipt) => {
+                receipts.push(receipt)
+                return true
+            }
+        })
+        assert.equal(receipts.length, 2)
+        assert.equal(sent.length, 0)
+        receipts[0].complete()
+        await new Promise<void>((done) => setImmediate(done))
+        assert.equal(sent.length, 0, 'one completed batch cannot release shared ordinary delivery')
+        const events: WaIncomingMessageEvent[] = []
+        await handleIncomingMessageAck(
+            { ...node, attrs: { ...node.attrs, id: 'opaque-live' } },
+            {
+                ...createDecryptingOptions(events),
+                sendNode: async (current) => {
+                    sent.push(current.attrs.id + ':' + (current.attrs.type ?? 'delivery'))
+                }
+            }
+        )
+        assert.equal(events.length, 1)
+        assert.deepEqual(sent, ['opaque-live:delivery'])
+        if (fails) receipts[1].fail()
+        else receipts[1].complete()
+        receipts[1].complete()
+        await new Promise<void>((done) => setImmediate(done))
+        for (const receipt of receipts) {
+            await receipt.sendHistorySyncReceipt()
+            await receipt.sendHistorySyncReceipt()
+        }
+        assert.deepEqual(
+            sent,
+            fails
+                ? ['opaque-live:delivery']
+                : ['opaque-live:delivery', 'msg-1:delivery', 'msg-1:hist_sync', 'msg-1:hist_sync']
+        )
+    }
+})

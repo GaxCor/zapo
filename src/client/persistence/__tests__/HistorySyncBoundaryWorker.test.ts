@@ -1208,3 +1208,218 @@ test('history worker accounts for a retained protobuf byte view backing buffer',
     assert.deepEqual(itemReceipt.state, ['fail'])
     assert.deepEqual(failures, ['queue_full'])
 })
+
+function acceptedDispositionsPayload(): Uint8Array {
+    const quoted = wireBytes(
+        6,
+        wireConcat(wireString(1, 'synthetic-quote'), wireString(4, 'synthetic-url-quoted'))
+    )
+    const content = wireBytes(
+        6,
+        wireConcat(
+            wireString(1, 'synthetic-direct'),
+            wireString(4, 'synthetic-url-outer'),
+            wireBytes(17, wireBytes(3, quoted))
+        )
+    )
+    const key = proto.MessageKey.encode({
+        remoteJid: 'synthetic-peer@s.whatsapp.net',
+        id: 'synthetic-key',
+        fromMe: false
+    }).finish()
+    const historyRecord = wireBytes(
+        1,
+        wireConcat(wireBytes(1, key), wireBytes(2, content), wireInteger(3, 123))
+    )
+    return wireConcat(
+        wireInteger(1, 3),
+        wireBytes(8, new Uint8Array()),
+        wireBytes(9, new Uint8Array([255])),
+        wireInteger(10, 1),
+        wireBytes(12, wireString(1, 'synthetic-group@g.us')),
+        wireBytes(13, new Uint8Array()),
+        wireBytes(
+            2,
+            wireConcat(wireString(1, 'synthetic-peer@s.whatsapp.net'), wireBytes(2, historyRecord))
+        )
+    )
+}
+
+for (const mode of [
+    'success',
+    'reject',
+    'cancel',
+    'timeout',
+    'stale',
+    'private_failure'
+] as const) {
+    test(`INT-01..07 accepted mixed batch held beside live delivery; settlement ${mode}`, async () => {
+        const limits = {
+            ...LIMITS,
+            maxBatchBytes: 65_536,
+            maxQueuedBytes: 65_536,
+            maxSourceRecordsPerBatch: 1_000,
+            timeoutMs: mode === 'timeout' ? 50 : 2_000
+        }
+        const entered = deferred()
+        const release = deferred()
+        const settled = deferred()
+        const sent: string[] = []
+        const failures: string[] = []
+        const logs: unknown[] = []
+        const logger = {
+            ...createNoopLogger(),
+            info: (message: string, ctx?: unknown) => logs.push([message, ctx]),
+            warn: (message: string, ctx?: unknown) => logs.push([message, ctx])
+        }
+        let generation = 1
+        let writes = 0
+        const worker = new HistorySyncBoundaryWorker(
+            limits,
+            async (input, signal, current, lifecycle) => {
+                await processHistorySyncNotification(
+                    {
+                        logger,
+                        mediaTransfer: {} as never,
+                        writeBehind: {
+                            persistMessageAsync: async (row: { messageBytes: Uint8Array }) => {
+                                assert.equal(
+                                    new TextDecoder()
+                                        .decode(row.messageBytes)
+                                        .includes('synthetic-url'),
+                                    false
+                                )
+                                writes += 1
+                                if (mode === 'private_failure')
+                                    throw new Error('synthetic-private-failure')
+                            },
+                            persistThreadAsync: async () => undefined,
+                            persistContactAsync: async () => undefined
+                        } as never,
+                        emitEvent: () => undefined,
+                        onProcessed: () => current.sendHistorySyncReceipt()
+                    } as never,
+                    input,
+                    {
+                        limits,
+                        signal,
+                        onBatch: async (batch) => {
+                            assert.equal(lifecycle.onStart(), true)
+                            assert.equal(
+                                batch.sourceFamilyDispositions.filter(
+                                    (row) => row.disposition === 'EXCLUDED_BY_ACCEPTED_SCOPE'
+                                ).length,
+                                7
+                            )
+                            assert.equal(batch.payloadIntegrityVerified, true)
+                            entered.resolve()
+                            try {
+                                await release.promise
+                                if (mode === 'reject') throw new Error('synthetic-callback-failure')
+                            } finally {
+                                lifecycle.onSettled()
+                            }
+                            if (signal.aborted) throw new Error('synthetic-cancelled')
+                            current.complete()
+                        }
+                    }
+                )
+            },
+            (reason) => failures.push(reason)
+        )
+        const historyMessage: Proto.IMessage = {
+            protocolMessage: {
+                type: proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+                historySyncNotification: {
+                    syncType: 3,
+                    initialHistBootstrapInlinePayload: gzipSync(acceptedDispositionsPayload())
+                }
+            }
+        }
+        const plaintext = (message: Proto.IMessage) => {
+            const encoded = proto.Message.encode(message).finish()
+            const padded = new Uint8Array(encoded.length + 1)
+            padded.set(encoded)
+            padded[encoded.length] = 1
+            return padded
+        }
+        const node = (id: string) => ({
+            tag: 'message',
+            attrs: { id, from: 'synthetic-peer@s.whatsapp.net' },
+            content: [{ tag: 'enc', attrs: { type: 'msg' }, content: new Uint8Array([1]) }]
+        })
+        await handleIncomingMessageAck(node('opaque-history'), {
+            logger,
+            sendNode: async (value) => {
+                sent.push(value.attrs.id + ':' + (value.attrs.type ?? 'delivery'))
+            },
+            captureBoundSendNode: () => {
+                const captured = generation
+                return async (value) => {
+                    if (captured !== generation) throw new Error('synthetic-stale-generation')
+                    sent.push(value.attrs.id + ':' + (value.attrs.type ?? 'delivery'))
+                }
+            },
+            signalProtocol: { decryptMessage: async () => plaintext(historyMessage) } as never,
+            scheduleHistorySync: (event, current) =>
+                worker.enqueue(
+                    event.message!.protocolMessage!.historySyncNotification!,
+                    current,
+                    () => settled.resolve()
+                )
+        })
+        await entered.promise
+        assert.equal(sent.length, 0)
+        assert.equal(writes, 0)
+        let liveEvents = 0
+        await handleIncomingMessageAck(node('opaque-live'), {
+            logger,
+            signalProtocol: {
+                decryptMessage: async () => plaintext({ conversation: 'synthetic-live' })
+            } as never,
+            emitIncomingMessage: () => {
+                liveEvents += 1
+            },
+            sendNode: async (value) => {
+                sent.push(value.attrs.id + ':' + (value.attrs.type ?? 'delivery'))
+            }
+        })
+        assert.equal(liveEvents, 1)
+        assert.deepEqual(sent, ['opaque-live:delivery'])
+        if (mode === 'stale') generation += 1
+        if (mode === 'cancel') await worker.cancelAndDrain()
+        else if (mode === 'timeout') {
+            // Library deadlines are intentionally unref'ed; the test owns a finite liveness handle.
+            const keepAlive = setTimeout(() => undefined, 2_000)
+            try {
+                await settled.promise
+            } finally {
+                clearTimeout(keepAlive)
+            }
+        } else release.resolve()
+        await settled.promise
+        release.resolve()
+        await new Promise<void>((done) => setImmediate(done))
+        const historySends = sent.filter((value) => value.startsWith('opaque-history'))
+        if (mode === 'success') {
+            assert.deepEqual(historySends, ['opaque-history:delivery', 'opaque-history:hist_sync'])
+            assert.equal(writes, 1)
+        } else if (mode === 'private_failure') {
+            assert.deepEqual(historySends, ['opaque-history:delivery'])
+            assert.equal(writes, 1)
+        } else {
+            assert.deepEqual(historySends, [])
+            if (mode === 'cancel' || mode === 'timeout') assert.equal(worker.getStatus(), 'FAULTED')
+        }
+        for (const evidence of [JSON.stringify(logs), JSON.stringify(failures)]) {
+            for (const forbidden of [
+                'synthetic-url',
+                'synthetic-peer',
+                'synthetic-group',
+                'synthetic-direct'
+            ])
+                assert.equal(evidence.includes(forbidden), false)
+        }
+        await worker.cancelAndDrain()
+    })
+}

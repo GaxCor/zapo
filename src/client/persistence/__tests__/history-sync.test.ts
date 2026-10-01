@@ -11,7 +11,7 @@ import {
     processHistorySyncNotification
 } from '@client/persistence/history-sync'
 import { WriteBehindPersistence } from '@client/persistence/WriteBehindPersistence'
-import type { WaHistorySyncMessageObservation } from '@client/types'
+import type { WaHistorySyncBatchV1, WaHistorySyncMessageObservation } from '@client/types'
 import { createNoopLogger } from '@infra/log/types'
 import { proto, type Proto } from '@proto'
 import type { WaStoredContactRecord } from '@store/contracts/contact.store'
@@ -566,7 +566,8 @@ test('history boundary rejects unknown fields on every consumed message wrapper'
                         }
                     }
                 ),
-            /unknown/
+            // Message tag 99 is pinned but this varint fixture has its wrong wire.
+            /unknown|malformed_history_protocol_field_wire/
         )
         assert.equal(callbackCalled, false, `${node} must fail before batch acceptance`)
         assert.deepEqual(capture.messages, [], `${node} must not persist a lossy message`)
@@ -1258,4 +1259,394 @@ test('history sync leaves an unresolved group author empty instead of naming the
     assert.equal(capture.messages.length, 1)
     assert.equal(capture.messages[0].senderJid, undefined)
     assert.equal(capture.messages[0].participantJid, undefined)
+})
+
+const DISPOSITION_LIMITS = {
+    maxConcurrentBatches: 1,
+    maxQueuedBatches: 1,
+    maxQueuedBytes: 65_536,
+    maxBatchBytes: 65_536,
+    maxMessagesPerBatch: 32,
+    maxSourceRecordsPerBatch: 1_000,
+    timeoutMs: 2_000
+}
+
+function acceptedRootFields(): Uint8Array {
+    return concatenate(
+        encodeBytesField(
+            8,
+            proto.GlobalSettings.encode({
+                avatarUserSettings: { password: 'synthetic-settings-secret' },
+                chatDbLidMigrationTimestamp: 1
+            }).finish()
+        ),
+        encodeBytesField(9, new TextEncoder().encode('synthetic-thread-secret')),
+        encodeVarintField(10, 0xffff_ffff),
+        encodeBytesField(
+            12,
+            proto.PastParticipants.encode({
+                groupJid: 'synthetic-group@g.us',
+                pastParticipants: [{ userJid: 'synthetic-participant@s.whatsapp.net', leaveTs: 1 }]
+            }).finish()
+        ),
+        encodeBytesField(13, proto.CallLogRecord.encode({ callId: 'synthetic-call-id' }).finish())
+    )
+}
+
+function dispositionHistory(
+    options: { parked?: boolean; bad?: Uint8Array; content?: Uint8Array } = {}
+): Uint8Array {
+    const extended = concatenate(
+        encodeStringField(1, 'exact synthetic text'),
+        encodeStringField(4, 'synthetic-excluded-url-outer'),
+        encodeBytesField(
+            17,
+            encodeBytesField(
+                3,
+                encodeBytesField(
+                    6,
+                    concatenate(
+                        encodeStringField(1, 'synthetic-quoted-body'),
+                        encodeStringField(4, 'synthetic-excluded-url-quoted')
+                    )
+                )
+            )
+        )
+    )
+    const message = options.content ?? encodeBytesField(6, extended)
+    const key = proto.MessageKey.encode({
+        remoteJid: 'synthetic-peer@s.whatsapp.net',
+        id: 'synthetic-message-id',
+        fromMe: false
+    }).finish()
+    const record = concatenate(
+        encodeBytesField(
+            1,
+            concatenate(
+                encodeBytesField(1, key),
+                encodeBytesField(2, message),
+                encodeVarintField(3, 123)
+            )
+        ),
+        encodeVarintField(2, 77)
+    )
+    const id = encodeStringField(1, 'synthetic-peer@s.whatsapp.net')
+    const messages = encodeBytesField(2, record)
+    const conversation = options.parked ? concatenate(messages, id) : concatenate(id, messages)
+    return concatenate(
+        encodeVarintField(1, 3),
+        acceptedRootFields(),
+        encodeBytesField(2, conversation),
+        options.bad ?? new Uint8Array()
+    )
+}
+
+async function dispositionProcess(
+    payload: Uint8Array,
+    onBatch?: (batch: WaHistorySyncBatchV1) => Promise<void>,
+    enabled = true
+) {
+    const { capture, deps } = createCapture()
+    let batch: WaHistorySyncBatchV1 | undefined
+    await processHistorySyncNotification(
+        deps as never,
+        {
+            syncType: 3,
+            initialHistBootstrapInlinePayload: toBytesView(await gzipAsync(payload))
+        },
+        enabled
+            ? {
+                  limits: DISPOSITION_LIMITS,
+                  signal: new AbortController().signal,
+                  onBatch: async (current) => {
+                      batch = current
+                      await onBatch?.(current)
+                  }
+              }
+            : undefined
+    )
+    return { capture, batch }
+}
+
+test('PROC-01/03/09 all exclusions coexist; canonical facts, parking and private archive stay exact', async () => {
+    for (const parked of [false, true]) {
+        const { capture, batch } = await dispositionProcess(dispositionHistory({ parked }))
+        assert.ok(batch)
+        const exclusions = batch.sourceFamilyDispositions.filter(
+            (row) => row.disposition === 'EXCLUDED_BY_ACCEPTED_SCOPE'
+        )
+        assert.deepEqual(
+            exclusions.map((row) => [row.scope, row.fieldNumber, row.count]),
+            [
+                ['MESSAGE_EXTENDED_TEXT', 4, 1],
+                ['QUOTED_MESSAGE_EXTENDED_TEXT', 4, 1],
+                ['ROOT', 8, 1],
+                ['ROOT', 9, 1],
+                ['ROOT', 10, 1],
+                ['ROOT', 12, 1],
+                ['ROOT', 13, 1]
+            ]
+        )
+        assert.deepEqual(batch.messageObservations[0], {
+            ordinal: 1,
+            conversationOrdinal: 1,
+            chatKind: 'DIRECT',
+            disposition: 'IMPORT_DIRECT',
+            externalMessageId: 'synthetic-message-id',
+            conversationAddress: 'synthetic-peer@s.whatsapp.net',
+            messageRemoteJid: 'synthetic-peer@s.whatsapp.net',
+            fromMe: false,
+            timestampSeconds: '123',
+            msgOrderId: '77',
+            content: { kind: 'TEXT', text: 'exact synthetic text' }
+        })
+        assert.equal(capture.messages.length, 1)
+        for (const value of [
+            JSON.stringify(batch),
+            JSON.stringify(capture.events),
+            JSON.stringify(capture.threads),
+            new TextDecoder().decode(capture.messages[0].messageBytes)
+        ]) {
+            for (const forbidden of [
+                'synthetic-settings-secret',
+                'synthetic-thread-secret',
+                'synthetic-participant',
+                'synthetic-group',
+                'synthetic-call-id',
+                'synthetic-excluded-url'
+            ])
+                assert.equal(value.includes(forbidden), false)
+        }
+        const archived = proto.Message.decode(capture.messages[0].messageBytes!)
+        assert.equal(archived.extendedTextMessage!.text, 'exact synthetic text')
+        assert.equal(archived.extendedTextMessage!.$unknowns?.length ?? 0, 0)
+        assert.equal(
+            archived.extendedTextMessage!.contextInfo!.quotedMessage!.extendedTextMessage!.$unknowns
+                ?.length ?? 0,
+            0
+        )
+        assert.deepEqual(capture.acked, [3])
+    }
+})
+
+test('PROC-02 repeated root occurrences and field order do not collapse physical counts', async () => {
+    const payload = concatenate(dispositionHistory(), acceptedRootFields(), acceptedRootFields())
+    const { batch } = await dispositionProcess(payload)
+    assert.ok(batch)
+    assert.ok(
+        batch.sourceFamilyDispositions
+            .filter((row) => row.scope === 'ROOT' && [8, 9, 10, 12, 13].includes(row.fieldNumber))
+            .every((row) => row.count === 3)
+    )
+})
+
+test('PROC-04/05 unrelated unknown or malformed accepted field blocks the whole batch before writes/callback', async () => {
+    for (const bad of [
+        encodeBytesField(11, new Uint8Array()),
+        encodeVarintField(10, 4_294_967_296),
+        encodeBytesField(8, encodeVarintField(999, 1)),
+        encodeBytesField(13, encodeBytesField(14, encodeVarintField(99, 1)))
+    ]) {
+        let called = false
+        await assert.rejects(
+            dispositionProcess(dispositionHistory({ bad }), async () => {
+                called = true
+            })
+        )
+        assert.equal(called, false)
+    }
+    await assert.rejects(
+        dispositionProcess(
+            dispositionHistory({
+                content: encodeBytesField(
+                    6,
+                    concatenate(
+                        encodeStringField(1, 'synthetic-body'),
+                        encodeStringField(4, 'synthetic-excluded-url'),
+                        encodeVarintField(99, 1)
+                    )
+                )
+            })
+        ),
+        /unknown_extended_text_fields/
+    )
+})
+
+test('PROC-06 field 4 never supplies body or repairs missing direct identity', async () => {
+    const { batch } = await dispositionProcess(
+        dispositionHistory({ content: encodeBytesField(6, encodeStringField(4, 'synthetic-url')) })
+    )
+    assert.equal(batch!.messageObservations[0].content.kind, 'UNSUPPORTED')
+    const badRecord = encodeBytesField(
+        1,
+        proto.WebMessageInfo.encode({
+            key: { remoteJid: 'synthetic-peer@s.whatsapp.net', fromMe: false },
+            message: { conversation: 'synthetic-body' }
+        }).finish()
+    )
+    const payload = concatenate(
+        encodeVarintField(1, 3),
+        acceptedRootFields(),
+        encodeBytesField(
+            2,
+            concatenate(
+                encodeStringField(1, 'synthetic-peer@s.whatsapp.net'),
+                encodeBytesField(2, badRecord)
+            )
+        )
+    )
+    await assert.rejects(dispositionProcess(payload), /missing_required_identity/)
+})
+
+test('PROC-07 root calls do not remove independently classified call-related observations', async () => {
+    const callMessage = proto.Message.encode({ callLogMesssage: {} }).finish()
+    // This pinned misspelled content key was already unclassified; do not expand its support.
+    await assert.rejects(
+        dispositionProcess(dispositionHistory({ content: callMessage })),
+        /content_unclassified/
+    )
+    const record = proto.HistorySyncMsg.encode({
+        message: {
+            key: {
+                remoteJid: 'synthetic-peer@s.whatsapp.net',
+                id: 'synthetic-message-id',
+                fromMe: false
+            },
+            message: { conversation: 'synthetic-call-stub-text' },
+            messageStubType: proto.WebMessageInfo.StubType.CALL_MISSED_VOICE
+        }
+    }).finish()
+    const payload = concatenate(
+        encodeVarintField(1, 3),
+        acceptedRootFields(),
+        encodeBytesField(
+            2,
+            concatenate(
+                encodeStringField(1, 'synthetic-peer@s.whatsapp.net'),
+                encodeBytesField(2, record)
+            )
+        )
+    )
+    const { batch } = await dispositionProcess(payload)
+    assert.equal(batch!.messageObservations.length, 1)
+    assert.equal(
+        batch!.messageObservations[0].messageStubType,
+        proto.WebMessageInfo.StubType.CALL_MISSED_VOICE
+    )
+    assert.equal(batch!.messageObservations[0].externalMessageId, 'synthetic-message-id')
+})
+
+test('PROC-08 excluded roots leave independently supported conversation/private handlers unchanged', async () => {
+    const payload = concatenate(dispositionHistory(), encodeBytesField(19, new Uint8Array([1, 2])))
+    const { capture, batch } = await dispositionProcess(payload)
+    assert.deepEqual(capture.salts, [new Uint8Array([1, 2])])
+    assert.equal(batch!.messageObservations[0].timestampSeconds, '123')
+    assert.equal(batch!.messageObservations[0].msgOrderId, '77')
+    assert.deepEqual(capture.tokens, [])
+})
+
+test('PROC-09 disabled boundary preserves legacy encoded unknown URL bytes unchanged', async () => {
+    const { capture, batch } = await dispositionProcess(dispositionHistory(), undefined, false)
+    assert.equal(batch, undefined)
+    const archived = proto.Message.decode(capture.messages[0].messageBytes!)
+    assert.equal(archived.extendedTextMessage!.$unknowns?.length, 1)
+    assert.equal(
+        archived.extendedTextMessage!.contextInfo!.quotedMessage!.extendedTextMessage!.$unknowns
+            ?.length,
+        1
+    )
+    assert.equal(
+        new TextDecoder()
+            .decode(capture.messages[0].messageBytes)
+            .includes('synthetic-excluded-url-outer'),
+        true
+    )
+})
+
+test('PROC-10 rejection/abort before callback success withholds processing and deferred writes', async () => {
+    const { capture, deps } = createCapture()
+    const input = {
+        syncType: 3,
+        initialHistBootstrapInlinePayload: toBytesView(await gzipAsync(dispositionHistory()))
+    }
+    await assert.rejects(
+        processHistorySyncNotification(deps as never, input, {
+            limits: DISPOSITION_LIMITS,
+            signal: new AbortController().signal,
+            onBatch: async () => {
+                throw new Error('synthetic-consumer-failure')
+            }
+        }),
+        /synthetic-consumer-failure/
+    )
+    assert.deepEqual(capture.messages, [])
+    assert.deepEqual(capture.acked, [])
+})
+
+for (const tag of [8, 9, 10, 12, 13]) {
+    test(`PROC matrix root ${tag}: standalone, repeated, mixed DIRECT and any unrelated blocker`, async () => {
+        const valid =
+            tag === 10
+                ? encodeVarintField(10, 0)
+                : encodeBytesField(
+                      tag,
+                      tag === 12 ? encodeStringField(1, 'synthetic-group@g.us') : new Uint8Array()
+                  )
+        const base = encodeVarintField(1, 3)
+        for (const payload of [
+            concatenate(base, valid),
+            concatenate(base, valid, valid),
+            concatenate(dispositionHistory(), valid)
+        ]) {
+            const { batch } = await dispositionProcess(payload)
+            const row = batch!.sourceFamilyDispositions.find(
+                (item) => item.scope === 'ROOT' && item.fieldNumber === tag
+            )!
+            assert.equal(row.disposition, 'EXCLUDED_BY_ACCEPTED_SCOPE')
+            assert.ok(row.count === 1 || row.count === 2)
+        }
+        for (const payload of [
+            concatenate(base, valid, encodeBytesField(11, new Uint8Array())),
+            concatenate(base, encodeBytesField(11, new Uint8Array()), valid),
+            concatenate(dispositionHistory(), valid, encodeBytesField(8, encodeVarintField(999, 1)))
+        ]) {
+            let called = false
+            await assert.rejects(
+                dispositionProcess(payload, async () => {
+                    called = true
+                })
+            )
+            assert.equal(called, false)
+        }
+    })
+}
+
+test('PROC nested work is charged exactly once across parked and nonparked processing', async () => {
+    for (const parked of [false, true]) {
+        const payload = dispositionHistory({ parked })
+        const input = {
+            syncType: 3,
+            initialHistBootstrapInlinePayload: toBytesView(await gzipAsync(payload))
+        }
+        let firstPassing = 0
+        for (let maxWork = 1; maxWork <= 100; maxWork += 1) {
+            const { capture, deps } = createCapture()
+            try {
+                await processHistorySyncNotification(deps as never, input, {
+                    limits: { ...DISPOSITION_LIMITS, maxSourceRecordsPerBatch: maxWork },
+                    signal: new AbortController().signal,
+                    onBatch: async () => undefined
+                })
+                firstPassing = maxWork
+                break
+            } catch (error) {
+                assert.match((error as Error).message, /source-record limit/)
+                assert.deepEqual(capture.messages, [])
+                assert.deepEqual(capture.acked, [])
+            }
+        }
+        // 8 stream FIELD events + 8 excluded-root descendants + 16 record descendants.
+        // Conversation ENTER/LEAVE, parked replay and projection add no FIELD work.
+        assert.equal(firstPassing, 32)
+    }
 })

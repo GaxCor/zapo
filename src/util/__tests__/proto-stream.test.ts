@@ -10,6 +10,42 @@ import {
 } from '@util/proto-stream'
 import { PROTO_WIRE_TYPES, scanProtoFields } from '@util/protoscan'
 
+for (const tag of [8, 9, 10, 12, 13, 999]) {
+    test(`strict stream rejects group root ${tag} before callback; legacy still skips`, async () => {
+        const value = tag * 8 + 3
+        const end = tag * 8 + 4
+        const encode = (n: number): number[] => {
+            const out = []
+            do {
+                const next = Math.floor(n / 128)
+                out.push((n % 128) | (next ? 128 : 0))
+                n = next
+            } while (n)
+            return out
+        }
+        const group = Uint8Array.from([...encode(value), 8, 1, ...encode(end)])
+        let callbacks = 0
+        await assert.rejects(
+            streamProtoFields(
+                Readable.from([group]),
+                () => {
+                    callbacks += 1
+                },
+                { rejectGroups: true }
+            ),
+            /group/
+        )
+        assert.equal(callbacks, 0)
+        assert.deepEqual(await collect(group), [])
+        assert.deepEqual(await collect(group, { rejectGroups: false }), [])
+        const nested = Uint8Array.from([18, group.length, ...group])
+        await assert.rejects(
+            collect(nested, { rejectGroups: true, shouldDescend: () => true }),
+            /group/
+        )
+    })
+}
+
 /** Splits `bytes` into fixed-size chunks so buffer refills land mid-field. */
 function chunked(bytes: Uint8Array, size: number): Readable {
     const chunks: Uint8Array[] = []

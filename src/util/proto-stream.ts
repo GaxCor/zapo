@@ -49,6 +49,8 @@ export type ProtoStreamEvent = ProtoStreamFieldEvent | ProtoStreamEnterEvent | P
 export type ProtoStreamHandler = (event: ProtoStreamEvent) => void | Promise<void>
 
 export interface ProtoStreamOptions {
+    /** Opt-in strict consumer policy: reject groups before they can be silently skipped. */
+    readonly rejectGroups?: boolean
     /** Recurse into a `LEN` field instead of materializing it; subfields arrive at `depth + 1`. */
     readonly shouldDescend?: (fieldNumber: number, depth: number, byteLength: number) => boolean
     /** Cap on one materialized payload. Descended fields are exempt. Defaults to 32 MiB. */
@@ -349,6 +351,9 @@ export async function streamProtoFields(
             value = EMPTY_BYTES
             varintValue = 0
         } else if (wireType === PROTO_WIRE_TYPES.START_GROUP) {
+            if (options.rejectGroups) {
+                throw new Error('unsupported protobuf group field')
+            }
             reader.takeMarked()
             await skipStreamGroup(reader)
             continue

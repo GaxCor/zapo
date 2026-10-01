@@ -7,5 +7,8 @@ export type {
     WaConnectionEvent,
     WaDeleteChatOptions,
     WaDeleteMessageForMeOptions,
+    WaHistorySyncBatchHandler,
+    WaHistorySyncBatchV1,
+    WaHistorySyncFamilyDisposition,
     WaLogoutStoreClearOptions
 } from '@client/types'

@@ -376,7 +376,7 @@ export interface WaHistorySyncBoundaryLimits {
     readonly maxBatchBytes: number
     /** Maximum message observations retained for one job. */
     readonly maxMessagesPerBatch: number
-    /** Maximum source protobuf records inspected for one job. */
+    /** Maximum inspected protobuf fields, including boundary-validated nested fields, for one job. */
     readonly maxSourceRecordsPerBatch: number
     /** Maximum processing/callback duration before abort is signalled. */
     readonly timeoutMs: number
@@ -408,9 +408,22 @@ export interface WaHistorySyncMessageObservation {
 }
 
 export interface WaHistorySyncFamilyDisposition {
-    readonly scope: 'ROOT' | 'CONVERSATION' | 'HISTORY_SYNC_MESSAGE' | 'WEB_MESSAGE_INFO'
+    /** Extended-text scopes qualify Message.ExtendedTextMessage, never similarly named types. */
+    readonly scope:
+        | 'ROOT'
+        | 'CONVERSATION'
+        | 'HISTORY_SYNC_MESSAGE'
+        | 'WEB_MESSAGE_INFO'
+        | 'MESSAGE_EXTENDED_TEXT'
+        | 'QUOTED_MESSAGE_EXTENDED_TEXT'
     readonly fieldNumber: number
-    readonly disposition: 'MESSAGE_OBSERVATIONS' | 'METADATA_ONLY' | 'BLOCKED_UNDECIDED'
+    /** Excluded rows carry no values; the closed scope/field policy identifies the accepted reason. */
+    readonly disposition:
+        | 'MESSAGE_OBSERVATIONS'
+        | 'METADATA_ONLY'
+        | 'BLOCKED_UNDECIDED'
+        | 'EXCLUDED_BY_ACCEPTED_SCOPE'
+    /** Physical validated wire occurrences, never unique values or participant counts. */
     readonly count: number
 }
 

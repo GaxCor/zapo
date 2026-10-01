@@ -1,4 +1,9 @@
 import { flushPendingWrites, openHistoryBlobStream } from '@client/persistence/history-blob'
+import {
+    type HistoryProtocolValidationContext,
+    prepareBoundaryHistoryRecord,
+    validateAcceptedHistoryRoot
+} from '@client/persistence/history-protocol-dispositions'
 import type { WriteBehindPersistence } from '@client/persistence/WriteBehindPersistence'
 import type {
     WaClientEventMap,
@@ -118,10 +123,7 @@ interface HistoryBoundaryCapture {
     readonly context: HistoryBoundaryMessageContext
     readonly notification: Proto.Message.IHistorySyncNotification
     readonly observations: WaHistorySyncMessageObservation[]
-    readonly familyDispositions: Map<
-        string,
-        { readonly disposition: WaHistorySyncFamilyDisposition['disposition']; count: number }
-    >
+    readonly familyDispositions: Map<string, WaHistorySyncFamilyDisposition>
     readonly metadataConflicts: Set<
         'notification_payload_chunk_order_mismatch' | 'notification_payload_progress_mismatch'
     >
@@ -339,17 +341,31 @@ async function consumeHistorySyncStream(
     let headerParts: Uint8Array[] | null = null
     let threadJid: string | null = null
     let parked: ParkedHistoryMessage[] | null = null
+    const validation: HistoryProtocolValidationContext | undefined = state.boundary
+        ? {
+              signal: state.boundary.context.signal,
+              maxFieldBytes: Math.min(
+                  HISTORY_SYNC_MAX_RECORD_BYTES,
+                  state.boundary.context.limits.maxBatchBytes
+              ),
+              chargeField: () => {
+                  const boundary = state.boundary!
+                  boundary.sourceRecordCount += 1
+                  if (
+                      boundary.sourceRecordCount > boundary.context.limits.maxSourceRecordsPerBatch
+                  ) {
+                      throw new Error(
+                          'history boundary batch exceeds configured source-record limit'
+                      )
+                  }
+              }
+          }
+        : undefined
 
-    const onEvent = (event: ProtoStreamEvent): void | Promise<void> => {
+    const onEvent = async (event: ProtoStreamEvent): Promise<void> => {
         throwIfAborted(state.boundary?.context.signal)
         if (event.kind === PROTO_STREAM_EVENT_KINDS.FIELD && state.boundary) {
-            state.boundary.sourceRecordCount += 1
-            if (
-                state.boundary.sourceRecordCount >
-                state.boundary.context.limits.maxSourceRecordsPerBatch
-            ) {
-                throw new Error('history boundary batch exceeds configured source-record limit')
-            }
+            validation!.chargeField()
         }
         if (event.kind === PROTO_STREAM_EVENT_KINDS.ENTER) {
             headerParts = []
@@ -388,6 +404,25 @@ async function consumeHistorySyncStream(
                 event.fieldNumber === CONVERSATION_FIELDS.MESSAGES &&
                 event.wireType === PROTO_WIRE_TYPES.LEN
             ) {
+                let recordBytes = event.value
+                if (validation) {
+                    const prepared = await prepareBoundaryHistoryRecord(recordBytes, validation)
+                    recordBytes = prepared.bytes
+                    for (const [scope, count] of [
+                        ['MESSAGE_EXTENDED_TEXT', prepared.outerCount],
+                        ['QUOTED_MESSAGE_EXTENDED_TEXT', prepared.quotedCount]
+                    ] as const) {
+                        if (count) {
+                            recordBoundaryFamily(
+                                state,
+                                scope,
+                                4,
+                                'EXCLUDED_BY_ACCEPTED_SCOPE',
+                                count
+                            )
+                        }
+                    }
+                }
                 if (state.boundary) {
                     if (
                         state.boundary.observations.length + state.boundaryParkedRecords.length >=
@@ -396,17 +431,17 @@ async function consumeHistorySyncStream(
                         throw new Error('history boundary batch exceeds configured message limit')
                     }
                     if (!threadJid || state.boundaryParkedRecords.length > 0) {
-                        state.boundaryParkedRecords.push(event.value.slice())
+                        state.boundaryParkedRecords.push(recordBytes.slice())
                     } else {
                         captureBoundaryMessage(
                             state,
-                            event.value,
+                            recordBytes,
                             threadJid,
                             state.conversationsCount
                         )
                     }
                 }
-                const message = readHistoryMessage(event.value)
+                const message = readHistoryMessage(recordBytes)
                 if (!message) {
                     return undefined
                 }
@@ -441,6 +476,16 @@ async function consumeHistorySyncStream(
         }
 
         if (event.kind === PROTO_STREAM_EVENT_KINDS.FIELD && state.boundary) {
+            if ([8, 9, 10, 12, 13].includes(event.fieldNumber)) {
+                await validateAcceptedHistoryRoot(
+                    event.fieldNumber,
+                    event.wireType,
+                    event.raw,
+                    validation!
+                )
+                recordBoundaryFamily(state, 'ROOT', event.fieldNumber, 'EXCLUDED_BY_ACCEPTED_SCOPE')
+                return
+            }
             recordRootFamily(state, event.fieldNumber, event.wireType)
             if (
                 event.fieldNumber === HISTORY_SYNC_FIELDS.SYNC_TYPE &&
@@ -503,6 +548,7 @@ async function consumeHistorySyncStream(
     }
 
     await streamProtoFields(inflated, onEvent, {
+        rejectGroups: Boolean(state.boundary),
         shouldDescend: (fieldNumber, depth) =>
             depth === 0 && fieldNumber === HISTORY_SYNC_FIELDS.CONVERSATIONS,
         maxFieldBytes: state.boundary
@@ -917,26 +963,30 @@ function recordBoundaryFamily(
     state: HistorySyncChunkState,
     scope: WaHistorySyncFamilyDisposition['scope'],
     fieldNumber: number,
-    disposition: WaHistorySyncFamilyDisposition['disposition']
+    disposition: WaHistorySyncFamilyDisposition['disposition'],
+    count = 1
 ): void {
     const boundary = state.boundary
     if (!boundary) return
     const key = `${scope}:${fieldNumber}`
     const existing = boundary.familyDispositions.get(key)
     boundary.familyDispositions.set(key, {
+        scope,
+        fieldNumber,
         disposition,
-        count: (existing?.count ?? 0) + 1
+        count: (existing?.count ?? 0) + count
     })
 }
 
 function rootFamilyDisposition(fieldNumber: number): WaHistorySyncFamilyDisposition['disposition'] {
+    if ([8, 9, 10, 12, 13].includes(fieldNumber)) return 'EXCLUDED_BY_ACCEPTED_SCOPE'
     if (fieldNumber === HISTORY_SYNC_FIELDS.CONVERSATIONS) return 'MESSAGE_OBSERVATIONS'
     if ([1, 5, 6, 7, 15, 19, 20, 21].includes(fieldNumber)) return 'METADATA_ONLY'
     return 'BLOCKED_UNDECIDED'
 }
 
 function rootFamilyWireType(fieldNumber: number): number {
-    return [1, 5, 6, 21].includes(fieldNumber) ? PROTO_WIRE_TYPES.VARINT : PROTO_WIRE_TYPES.LEN
+    return [1, 5, 6, 10, 21].includes(fieldNumber) ? PROTO_WIRE_TYPES.VARINT : PROTO_WIRE_TYPES.LEN
 }
 
 function recordConversationField(
@@ -967,19 +1017,10 @@ function recordConversationField(
 }
 
 function toFamilyDispositions(boundary: HistoryBoundaryCapture): WaHistorySyncFamilyDisposition[] {
-    return [...boundary.familyDispositions.entries()]
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, value]) => {
-            const separator = key.indexOf(':')
-            const scope = key.slice(0, separator) as WaHistorySyncFamilyDisposition['scope']
-            const fieldNumber = Number(key.slice(separator + 1))
-            return {
-                scope,
-                fieldNumber,
-                disposition: value.disposition,
-                count: value.count
-            }
-        })
+    return [...boundary.familyDispositions.values()].sort(
+        (left, right) =>
+            left.scope.localeCompare(right.scope) || left.fieldNumber - right.fieldNumber
+    )
 }
 
 async function invokeBoundaryCallback(
