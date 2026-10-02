@@ -904,6 +904,8 @@ test('visible ExtendedTextMessage unknowns fail closed through the receipt gate'
                     logger: createNoopLogger(),
                     mediaTransfer: {} as never,
                     writeBehind: {
+                        ownHistoryOperation: (start: () => Promise<void>) => start(),
+                        historyOperationsSettled: () => false,
                         persistMessageAsync: async () => undefined,
                         persistThreadAsync: async () => undefined,
                         persistContactAsync: async () => undefined
@@ -997,6 +999,8 @@ test('reconnect after history decode permanently stales the deferred receipt sen
                     logger: createNoopLogger(),
                     mediaTransfer: {} as never,
                     writeBehind: {
+                        ownHistoryOperation: (start: () => Promise<void>) => start(),
+                        historyOperationsSettled: () => false,
                         persistMessageAsync: async () => undefined,
                         persistThreadAsync: async () => undefined,
                         persistContactAsync: async () => undefined
@@ -1282,6 +1286,8 @@ for (const mode of [
                         logger,
                         mediaTransfer: {} as never,
                         writeBehind: {
+                            ownHistoryOperation: (start: () => Promise<void>) => start(),
+                            historyOperationsSettled: () => false,
                             persistMessageAsync: async (row: { messageBytes: Uint8Array }) => {
                                 assert.equal(
                                     new TextDecoder()

@@ -1,6 +1,7 @@
 import { pipeline, Readable } from 'node:stream'
 import { createUnzip } from 'node:zlib'
 
+import { historyFailure } from '@client/persistence/history-failure'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import type { MediaCryptoType } from '@media/types'
 import { decodeProtoBytes } from '@util/bytes'
@@ -54,6 +55,10 @@ export interface WaHistoryBlobStream {
      * as applied.
      */
     readonly verified: Promise<unknown>
+    /** Internal job-local teardown; repeated cancellation is harmless. */
+    readonly cancel: () => void
+    /** Real stream and verification settlement, never a timeout surrogate. */
+    readonly settled: Promise<void>
 }
 
 export interface WaHistoryBlobStreamOptions {
@@ -77,46 +82,88 @@ export async function openHistoryBlobStream(
     inlinePayload?: Uint8Array | string | null,
     options: WaHistoryBlobStreamOptions = {}
 ): Promise<WaHistoryBlobStream> {
-    if (inlinePayload) {
-        const bytes = decodeProtoBytes(inlinePayload, `${label} inline payload`)
-        if (
-            options.maxEncryptedBytes !== undefined &&
-            bytes.byteLength > options.maxEncryptedBytes
-        ) {
-            throw new Error(`${label} inline payload exceeds the configured byte limit`)
+    const transfer = new AbortController()
+    let blob: WaHistoryBlobStream | undefined
+    const cancel = (): void => {
+        // Identify caller-driven teardown before the pipeline propagates a
+        // generic premature-close error. A previous parser failure still wins.
+        const error = historyFailure('CANCELLED')
+        blob?.inflated.destroy(error)
+        transfer.abort(error)
+        blob?.cancel()
+    }
+    const unlink = (): void => options.signal?.removeEventListener('abort', cancel)
+    options.signal?.addEventListener('abort', cancel, { once: true })
+    if (options.signal?.aborted) cancel()
+    try {
+        if (transfer.signal.aborted) throw transfer.signal.reason
+        if (inlinePayload) {
+            const bytes = decodeProtoBytes(inlinePayload, `${label} inline payload`)
+            if (
+                options.maxEncryptedBytes !== undefined &&
+                bytes.byteLength > options.maxEncryptedBytes
+            ) {
+                throw new Error(`${label} inline payload exceeds the configured byte limit`)
+            }
+            blob = inflateHistoryStream(
+                Readable.from([bytes]),
+                Promise.resolve(null),
+                transfer,
+                unlink
+            )
+            void blob.settled.then(unlink)
+            return blob
         }
-        return inflateHistoryStream(Readable.from([bytes]), Promise.resolve(null))
+        if (!source.directPath) {
+            throw new Error(`${label} missing directPath`)
+        }
+        const decrypted = await mediaTransfer.downloadAndDecryptStream({
+            directPath: source.directPath,
+            mediaType,
+            mediaKey: decodeProtoBytes(source.mediaKey, `${label} mediaKey`),
+            fileSha256: decodeProtoBytes(source.fileSha256, `${label} fileSha256`),
+            fileEncSha256: decodeProtoBytes(source.fileEncSha256, `${label} fileEncSha256`),
+            signal: transfer.signal,
+            maxEncryptedBytes: options.maxEncryptedBytes
+        })
+        blob = inflateHistoryStream(decrypted.plaintext, decrypted.metadata, transfer, unlink)
+        void blob.settled.then(unlink)
+        if (transfer.signal.aborted) blob.cancel()
+        return blob
+    } catch (error) {
+        cancel()
+        unlink()
+        throw error
     }
-    if (!source.directPath) {
-        throw new Error(`${label} missing directPath`)
-    }
-    const decrypted = await mediaTransfer.downloadAndDecryptStream({
-        directPath: source.directPath,
-        mediaType,
-        mediaKey: decodeProtoBytes(source.mediaKey, `${label} mediaKey`),
-        fileSha256: decodeProtoBytes(source.fileSha256, `${label} fileSha256`),
-        fileEncSha256: decodeProtoBytes(source.fileEncSha256, `${label} fileEncSha256`),
-        signal: options.signal,
-        maxEncryptedBytes: options.maxEncryptedBytes
-    })
-    return inflateHistoryStream(decrypted.plaintext, decrypted.metadata)
 }
 
 /**
  * `createUnzip` detects the framing. `pipeline` rather than `pipe` so failure
- * closes both directions: a consumer that destroys `inflated` mid-chunk also
- * tears down the decryption pump and its socket, which `pipe` would leave
- * draining. Also parks a handler on `verified` so an early rejection is never
- * unobserved.
+ * closes plaintext and unzip. The job-local controller and history crypto pump
+ * additionally own the independent encrypted producer; pipeline alone does not.
  */
 function inflateHistoryStream(
     plaintext: Readable,
-    verified: Promise<unknown>
+    verified: Promise<unknown>,
+    transfer: AbortController,
+    unlink: () => void
 ): WaHistoryBlobStream {
     const unzip = createUnzip()
-    pipeline(plaintext, unzip, () => undefined)
+    const cancel = (): void => {
+        unlink()
+        transfer.abort(new Error('history transfer cancelled'))
+        plaintext.destroy()
+        unzip.destroy()
+    }
+    const piped = new Promise<void>((resolve) => {
+        pipeline(plaintext, unzip, (error) => {
+            if (error) cancel()
+            resolve()
+        })
+    })
     verified.catch(() => undefined)
-    return { inflated: unzip, verified }
+    const settled = Promise.allSettled([piped, verified]).then(() => undefined)
+    return { inflated: unzip, verified, cancel, settled }
 }
 
 /**

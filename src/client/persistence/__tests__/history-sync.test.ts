@@ -182,6 +182,8 @@ function createCapture(meJid?: string): { readonly capture: Capture; readonly de
         logger: createNoopLogger(),
         mediaTransfer: {} as never,
         writeBehind: {
+            ownHistoryOperation: (start: () => Promise<void>) => start(),
+            historyOperationsSettled: () => false,
             persistMessageAsync: async (record: WaStoredMessageRecord) => {
                 capture.order.push(`msg:${record.id}`)
                 capture.messages.push(record)
@@ -494,8 +496,8 @@ test('history boundary rejects unknown fields nested below extended-text metadat
     const rawPayload = buildHistoryWithUnknown('extended_text_context_info')
     const decoded = proto.HistorySync.decode(rawPayload)
     const nestedUnknowns =
-        decoded.conversations?.[0]?.messages?.[0]?.message?.message?.extendedTextMessage?.contextInfo
-            ?.$unknowns
+        decoded.conversations?.[0]?.messages?.[0]?.message?.message?.extendedTextMessage
+            ?.contextInfo?.$unknowns
     assert.equal(nestedUnknowns?.length, 1, 'synthetic field 99 must decode on ContextInfo')
 
     const { capture, deps } = createCapture()
@@ -862,6 +864,8 @@ test('history sync abort on a corrupt conversation settles pending writes', asyn
         logger: createNoopLogger(),
         mediaTransfer: null as never,
         writeBehind: {
+            ownHistoryOperation: (start: () => Promise<void>) => start(),
+            historyOperationsSettled: () => false,
             persistContactAsync: async () => undefined,
             persistThreadAsync: (input: { readonly jid: string }) => {
                 threadJids.push(input.jid)

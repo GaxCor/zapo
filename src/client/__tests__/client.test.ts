@@ -84,6 +84,8 @@ test('history sync processor persists conversations and emits chunk event', asyn
                 }
             } as never,
             writeBehind: {
+                ownHistoryOperation: (start: () => Promise<void>) => start(),
+                historyOperationsSettled: () => false,
                 persistMessageAsync: async (record: unknown) => {
                     messageCalls += 1
                     messages.push(record)
@@ -148,6 +150,8 @@ test('history sync processor handles ON_DEMAND chunks (peer-data-operation respo
                 }
             } as never,
             writeBehind: {
+                ownHistoryOperation: (start: () => Promise<void>) => start(),
+                historyOperationsSettled: () => false,
                 persistMessageAsync: async () => undefined,
                 persistThreadAsync: async () => undefined,
                 persistContactAsync: async () => undefined
@@ -211,6 +215,8 @@ test('history sync processor does not emit chunk event when chunk persistence fa
                         }
                     } as never,
                     writeBehind: {
+                        ownHistoryOperation: (start: () => Promise<void>) => start(),
+                        historyOperationsSettled: () => false,
                         persistMessageAsync: async () => {
                             throw new Error('persist failed')
                         },
@@ -263,6 +269,8 @@ test('history sync processor forwards privacy token payloads and nct salt hooks'
                 }
             } as never,
             writeBehind: {
+                ownHistoryOperation: (start: () => Promise<void>) => start(),
+                historyOperationsSettled: () => false,
                 persistMessageAsync: async () => undefined,
                 persistThreadAsync: async () => undefined,
                 persistContactAsync: async () => undefined
@@ -338,6 +346,8 @@ test('history sync processor skips stub messages (system events)', async () => {
                 }
             } as never,
             writeBehind: {
+                ownHistoryOperation: (start: () => Promise<void>) => start(),
+                historyOperationsSettled: () => false,
                 persistMessageAsync: async (record: { id: string }) => {
                     persistedIds.push(record.id)
                 },
@@ -381,6 +391,8 @@ test('history sync processor persists phoneNumberToLidMappings as a single LID-c
                 }
             } as never,
             writeBehind: {
+                ownHistoryOperation: (start: () => Promise<void>) => start(),
+                historyOperationsSettled: () => false,
                 persistMessageAsync: async () => undefined,
                 persistThreadAsync: async () => undefined,
                 persistContactAsync: async (record: {
@@ -438,6 +450,8 @@ test('history sync processor coalesces pushname onto the LID-canonical row when 
                 }
             } as never,
             writeBehind: {
+                ownHistoryOperation: (start: () => Promise<void>) => start(),
+                historyOperationsSettled: () => false,
                 persistMessageAsync: async () => undefined,
                 persistThreadAsync: async () => undefined,
                 persistContactAsync: async (record: {
@@ -490,6 +504,8 @@ test('history sync processor invokes onProcessed after handled chunk (for hist_s
                 }
             } as never,
             writeBehind: {
+                ownHistoryOperation: (start: () => Promise<void>) => start(),
+                historyOperationsSettled: () => false,
                 persistMessageAsync: async () => undefined,
                 persistThreadAsync: async () => undefined,
                 persistContactAsync: async () => undefined
@@ -519,6 +535,8 @@ test('history sync processor invokes onProcessed for INITIAL_STATUS_V3 (recogniz
                 }
             } as never,
             writeBehind: {
+                ownHistoryOperation: (start: () => Promise<void>) => start(),
+                historyOperationsSettled: () => false,
                 persistMessageAsync: async () => undefined,
                 persistThreadAsync: async () => undefined,
                 persistContactAsync: async () => undefined
@@ -543,6 +561,8 @@ test('history sync processor does NOT invoke onProcessed when syncType is null',
             logger: createNoopLogger(),
             mediaTransfer: { downloadAndDecryptStream: async () => new Uint8Array() } as never,
             writeBehind: {
+                ownHistoryOperation: (start: () => Promise<void>) => start(),
+                historyOperationsSettled: () => false,
                 persistMessageAsync: async () => undefined,
                 persistThreadAsync: async () => undefined,
                 persistContactAsync: async () => undefined
@@ -583,6 +603,8 @@ test('history sync processor handles NON_BLOCKING_DATA syncType (previously skip
                 }
             } as never,
             writeBehind: {
+                ownHistoryOperation: (start: () => Promise<void>) => start(),
+                historyOperationsSettled: () => false,
                 persistMessageAsync: async () => undefined,
                 persistThreadAsync: async (record: { jid: string }) => {
                     threadWrites.push(record)

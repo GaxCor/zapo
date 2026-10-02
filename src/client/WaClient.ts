@@ -22,6 +22,7 @@ import {
     persistIncomingEphemeralSetting
 } from '@client/persistence/ephemeral-setting'
 import { runGroupHistoryBundle } from '@client/persistence/group-history'
+import { historyFailure, markHistoryFailure } from '@client/persistence/history-failure'
 import {
     processHistorySyncNotification,
     runHistorySyncNotification
@@ -528,9 +529,15 @@ class WaClientImpl extends EventEmitter {
                 signal,
                 onBatch: async (batch, context) => {
                     if (!callbackLifecycle.onStart()) {
-                        throw signal.reason instanceof Error
-                            ? signal.reason
-                            : new Error('history boundary is no longer accepting callbacks')
+                        const error =
+                            signal.reason instanceof Error
+                                ? signal.reason
+                                : historyFailure('CALLBACK_ADMISSION_REJECTED')
+                        throw markHistoryFailure(
+                            error,
+                            'CALLBACK_ADMISSION_REJECTED',
+                            'CALLBACK_ADMISSION_REJECTED'
+                        )
                     }
                     try {
                         await history.onBatch!(batch, context)

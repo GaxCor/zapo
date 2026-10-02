@@ -1,5 +1,11 @@
 import { flushPendingWrites, openHistoryBlobStream } from '@client/persistence/history-blob'
 import {
+    historyFailure,
+    type HistoryFailureReason,
+    markHistoryFailure,
+    waitHistoryCleanup
+} from '@client/persistence/history-failure'
+import {
     type HistoryProtocolValidationContext,
     prepareBoundaryHistoryRecord,
     validateAcceptedHistoryRoot
@@ -128,12 +134,14 @@ interface HistoryBoundaryCapture {
         'notification_payload_chunk_order_mismatch' | 'notification_payload_progress_mismatch'
     >
     readonly deferredMessageWrites: Array<() => Promise<void>>
-    blockedReason: string | null
+    blockedReason: Error | null
     decodedSyncType: number | null
     sourceRecordCount: number
 }
 
 interface HistorySyncChunkState {
+    readonly writeBehind: WriteBehindPersistence
+    readonly maxOutstandingHistoryWrites: number
     readonly nowMs: number
     readonly pendingWrites: Promise<void>[]
     readonly pushnames: Proto.IPushname[]
@@ -211,6 +219,20 @@ export async function processHistorySyncNotification(
     )
 
     const state: HistorySyncChunkState = {
+        writeBehind: deps.writeBehind,
+        maxOutstandingHistoryWrites: boundaryContext
+            ? Math.min(
+                  Number.MAX_SAFE_INTEGER,
+                  Math.max(
+                      4_096,
+                      (boundaryContext.limits.maxSourceRecordsPerBatch +
+                          boundaryContext.limits.maxMessagesPerBatch +
+                          2) *
+                          boundaryContext.limits.maxConcurrentBatches +
+                          4_096
+                  )
+              )
+            : 4_096,
         nowMs: Date.now(),
         pendingWrites: [],
         pushnames: [],
@@ -240,96 +262,132 @@ export async function processHistorySyncNotification(
         messagesCount: 0
     }
 
+    let phase: HistoryFailureReason = 'WALK_FAILED'
     try {
         throwIfAborted(boundaryContext?.signal)
         await consumeHistorySyncStream(deps, blob.inflated, state)
-    } catch (error) {
-        blob.inflated.destroy(toError(error))
-        await Promise.allSettled(state.pendingWrites)
+
+        phase = 'VERIFICATION_REJECTED'
         await abortable(
-            blob.verified.catch(() => undefined),
+            blob.verified.then(() => undefined),
             boundaryContext?.signal
         )
-        throw toError(error)
-    }
 
-    await abortable(
-        blob.verified.then(() => undefined),
-        boundaryContext?.signal
-    )
-
-    if (state.boundary) {
-        throwIfAborted(state.boundary.context.signal)
-        if (state.boundary.blockedReason) {
-            throw new Error(`history boundary batch blocked: ${state.boundary.blockedReason}`)
+        if (state.boundary) {
+            throwIfAborted(state.boundary.context.signal)
+            if (state.boundary.blockedReason) {
+                throw markHistoryFailure(
+                    state.boundary.blockedReason,
+                    'WALK_FAILED',
+                    'POST_EOF_GATE_REJECTED'
+                )
+            }
+            phase = 'BATCH_PROJECTION_FAILED'
+            const batch = {
+                version: 1 as const,
+                sourceHistoryCompleteness: 'UNKNOWN' as const,
+                notification: {
+                    syncType,
+                    ...(notification.chunkOrder !== null && notification.chunkOrder !== undefined
+                        ? { chunkOrder: notification.chunkOrder }
+                        : {}),
+                    ...(notification.progress !== null && notification.progress !== undefined
+                        ? { progress: notification.progress }
+                        : {}),
+                    ...(notification.originalMessageId
+                        ? { originalMessageId: notification.originalMessageId }
+                        : {}),
+                    ...(notification.oldestMsgInChunkTimestampSec !== null &&
+                    notification.oldestMsgInChunkTimestampSec !== undefined
+                        ? {
+                              oldestMsgInChunkTimestampSec: longToString(
+                                  notification.oldestMsgInChunkTimestampSec
+                              )
+                          }
+                        : {})
+                },
+                decoded: {
+                    ...(state.boundary.decodedSyncType !== null
+                        ? { syncType: state.boundary.decodedSyncType }
+                        : {}),
+                    ...(state.chunkOrder !== null ? { chunkOrder: state.chunkOrder } : {}),
+                    ...(state.progress !== null ? { progress: state.progress } : {})
+                },
+                parseReachedEof: true as const,
+                payloadIntegrityVerified: true as const,
+                sourceFamilyDispositions: toFamilyDispositions(state.boundary),
+                metadataConflicts: [...state.boundary.metadataConflicts].sort(),
+                messageObservations: state.boundary.observations
+            }
+            phase = 'CALLBACK_REJECTED'
+            await invokeBoundaryCallback(state.boundary.context, batch)
+            phase = 'PRIVATE_SETTLEMENT_REJECTED'
+            for (const persist of state.boundary.deferredMessageWrites) {
+                pushWrite(state, persist)
+            }
         }
-        const batch = {
-            version: 1 as const,
-            sourceHistoryCompleteness: 'UNKNOWN' as const,
-            notification: {
-                syncType,
-                ...(notification.chunkOrder !== null && notification.chunkOrder !== undefined
-                    ? { chunkOrder: notification.chunkOrder }
-                    : {}),
-                ...(notification.progress !== null && notification.progress !== undefined
-                    ? { progress: notification.progress }
-                    : {}),
-                ...(notification.originalMessageId
-                    ? { originalMessageId: notification.originalMessageId }
-                    : {}),
-                ...(notification.oldestMsgInChunkTimestampSec !== null &&
-                notification.oldestMsgInChunkTimestampSec !== undefined
-                    ? {
-                          oldestMsgInChunkTimestampSec: longToString(
-                              notification.oldestMsgInChunkTimestampSec
-                          )
-                      }
-                    : {})
-            },
-            decoded: {
-                ...(state.boundary.decodedSyncType !== null
-                    ? { syncType: state.boundary.decodedSyncType }
-                    : {}),
-                ...(state.chunkOrder !== null ? { chunkOrder: state.chunkOrder } : {}),
-                ...(state.progress !== null ? { progress: state.progress } : {})
-            },
-            parseReachedEof: true as const,
-            payloadIntegrityVerified: true as const,
-            sourceFamilyDispositions: toFamilyDispositions(state.boundary),
-            metadataConflicts: [...state.boundary.metadataConflicts].sort(),
-            messageObservations: state.boundary.observations
+
+        phase = 'PRIVATE_SETTLEMENT_REJECTED'
+        await settleHistorySyncChunk(deps, state)
+
+        deps.logger.info('decoded history sync chunk', {
+            syncType,
+            chunkOrder: state.chunkOrder,
+            progress: state.progress,
+            conversations: state.conversationsCount,
+            messages: state.messagesCount,
+            pushnames: state.pushnames.length,
+            inlineContacts: state.inlineContacts.length
+        })
+
+        const event: WaHistorySyncChunkEvent = {
+            syncType,
+            messagesCount: state.messagesCount,
+            conversationsCount: state.conversationsCount,
+            pushnamesCount: state.pushnames.length,
+            inlineContactsCount: state.inlineContacts.length,
+            chunkOrder: state.chunkOrder ?? undefined,
+            progress: state.progress ?? undefined
         }
-        await invokeBoundaryCallback(state.boundary.context, batch)
-        for (const persist of state.boundary.deferredMessageWrites) {
-            pushWrite(state, persist())
+        await abortable(flushPendingWrites(state.pendingWrites), state.boundary?.context.signal)
+        deps.emitEvent('history_sync_chunk', event)
+        if (deps.onProcessed) {
+            await deps.onProcessed(syncType)
         }
-    }
-
-    await settleHistorySyncChunk(deps, state)
-
-    deps.logger.info('decoded history sync chunk', {
-        syncType,
-        chunkOrder: state.chunkOrder,
-        progress: state.progress,
-        conversations: state.conversationsCount,
-        messages: state.messagesCount,
-        pushnames: state.pushnames.length,
-        inlineContacts: state.inlineContacts.length
-    })
-
-    const event: WaHistorySyncChunkEvent = {
-        syncType,
-        messagesCount: state.messagesCount,
-        conversationsCount: state.conversationsCount,
-        pushnamesCount: state.pushnames.length,
-        inlineContactsCount: state.inlineContacts.length,
-        chunkOrder: state.chunkOrder ?? undefined,
-        progress: state.progress ?? undefined
-    }
-    await abortable(flushPendingWrites(state.pendingWrites), state.boundary?.context.signal)
-    deps.emitEvent('history_sync_chunk', event)
-    if (deps.onProcessed) {
-        await deps.onProcessed(syncType)
+    } catch (caught) {
+        const error = markHistoryFailure(
+            toError(caught),
+            phase,
+            phase === 'WALK_FAILED'
+                ? 'WALK_FAILED'
+                : phase === 'BATCH_PROJECTION_FAILED'
+                  ? 'BATCH_PROJECTION_FAILED'
+                  : undefined
+        )
+        markHistoryFailure(error, phase, 'CLEANUP_CANCEL_REQUESTED')
+        blob.cancel()
+        // Non-cancellable provider work already has private ownership. Do not
+        // attach an abandoned allSettled continuation for every failed job.
+        markHistoryFailure(error, phase, 'CLEANUP_WRITES_WAIT')
+        const writesSettled =
+            state.pendingWrites.length === 0 ||
+            state.writeBehind.historyOperationsSettled(state.pendingWrites)
+        markHistoryFailure(
+            error,
+            phase,
+            writesSettled ? 'CLEANUP_WRITES_SETTLED' : 'CLEANUP_WRITES_RETAINED'
+        )
+        state.pendingWrites.length = 0
+        if (state.boundary) state.boundary.deferredMessageWrites.length = 0
+        state.boundaryParkedRecords.length = 0
+        markHistoryFailure(error, phase, 'CLEANUP_VERIFY_WAIT')
+        const transferSettled = await waitHistoryCleanup(blob.settled, boundaryContext?.signal)
+        markHistoryFailure(
+            error,
+            phase,
+            transferSettled ? 'CLEANUP_VERIFY_SETTLED' : 'CLEANUP_ABORTED'
+        )
+        throw error
     }
 }
 
@@ -491,7 +549,12 @@ async function consumeHistorySyncStream(
                 event.fieldNumber === HISTORY_SYNC_FIELDS.SYNC_TYPE &&
                 event.varintValue !== state.boundary.notification.syncType
             ) {
-                state.boundary.blockedReason ??= 'notification_payload_sync_type_mismatch'
+                state.boundary.blockedReason ??= historyFailure(
+                    'notification_payload_sync_type_mismatch',
+                    'HistorySync',
+                    1,
+                    event.wireType
+                )
             }
         }
 
@@ -571,17 +634,31 @@ async function closeConversation(
     const resolvedJid = threadJid ?? conversation.id
     if (!resolvedJid) {
         if (state.boundary) {
-            state.boundary.blockedReason ??= 'missing_conversation_address'
+            state.boundary.blockedReason ??= historyFailure(
+                'missing_conversation_address',
+                'Conversation',
+                1,
+                null
+            )
         }
         deps.logger.debug('skipping history sync conversation without thread jid')
         return
     }
     if (state.boundary) {
         if (conversation.$unknowns?.length) {
-            state.boundary.blockedReason ??= 'unknown_conversation_fields'
+            state.boundary.blockedReason ??= unknownFieldFailure(
+                'unknown_conversation_fields',
+                'Conversation',
+                conversation.$unknowns
+            )
         }
         if (classifyHistoryChat(resolvedJid) === 'UNKNOWN') {
-            state.boundary.blockedReason ??= 'unclassified_conversation_address'
+            state.boundary.blockedReason ??= historyFailure(
+                'unclassified_conversation_address',
+                'Conversation',
+                1,
+                2
+            )
         }
         for (const record of boundaryRecords) {
             captureBoundaryMessage(state, record, resolvedJid, conversationOrdinal)
@@ -614,10 +691,10 @@ async function closeConversation(
         normalizeEphemeralSettingSeconds(longToNumber(conversation.ephemeralSettingTimestamp)) ||
         undefined
     if (deps.chatMetadataStore && ephemeralExpiration !== undefined) {
-        pushWrite(
-            state,
-            deps.chatMetadataStore
-                .upsertChatMetadata({
+        const boundaryMode = Boolean(state.boundary)
+        pushWrite(state, () =>
+            deps
+                .chatMetadataStore!.upsertChatMetadata({
                     chatJid: resolvedJid,
                     ephemeralExpiration,
                     ...(ephemeralSettingTimestamp !== undefined
@@ -626,6 +703,10 @@ async function closeConversation(
                     updatedAtMs: state.nowMs
                 })
                 .catch((error: unknown) => {
+                    if (boundaryMode) {
+                        deps.logger.debug('failed to cache history sync chat metadata')
+                        return
+                    }
                     deps.logger.debug('failed to cache history sync chat metadata', {
                         jid: resolvedJid,
                         message: toError(error).message
@@ -633,8 +714,7 @@ async function closeConversation(
                 })
         )
     }
-    pushWrite(
-        state,
+    pushWrite(state, () =>
         deps.writeBehind.persistThreadAsync({
             jid: resolvedJid,
             name: conversation.name ?? undefined,
@@ -656,8 +736,7 @@ async function closeConversation(
         const contactPn = conversation.pnJid ?? undefined
         const contactLid = conversation.lidJid ?? conversation.accountLid ?? undefined
         if (contactDisplay || contactUsername || contactPn || contactLid) {
-            pushWrite(
-                state,
+            pushWrite(state, () =>
                 deps.writeBehind.persistContactAsync({
                     jid: contactLid ?? resolvedJid,
                     displayName: contactDisplay,
@@ -709,7 +788,7 @@ function persistHistoryMessage(
     if (state.boundary) {
         state.boundary.deferredMessageWrites.push(persist)
     } else {
-        pushWrite(state, persist())
+        pushWrite(state, persist)
     }
 }
 
@@ -721,19 +800,19 @@ async function settleHistorySyncChunk(
         if (!pushname.id) {
             continue
         }
-        const lidJid = state.pnToLid.get(pushname.id)
-        pushWrite(
-            state,
+        const pushnameId = pushname.id
+        const lidJid = state.pnToLid.get(pushnameId)
+        pushWrite(state, () =>
             deps.writeBehind.persistContactAsync(
                 lidJid
                     ? {
                           jid: lidJid,
                           pushName: pushname.pushname ?? undefined,
-                          phoneNumber: pushname.id,
+                          phoneNumber: pushnameId,
                           lastUpdatedMs: state.nowMs
                       }
                     : {
-                          jid: pushname.id,
+                          jid: pushnameId,
                           pushName: pushname.pushname ?? undefined,
                           lastUpdatedMs: state.nowMs
                       }
@@ -751,8 +830,7 @@ async function settleHistorySyncChunk(
         if (!displayName && !contact.pnJid) {
             continue
         }
-        pushWrite(
-            state,
+        pushWrite(state, () =>
             deps.writeBehind.persistContactAsync({
                 jid,
                 displayName,
@@ -764,8 +842,7 @@ async function settleHistorySyncChunk(
     }
 
     for (const [pnJid, lidJid] of state.pnToLid) {
-        pushWrite(
-            state,
+        pushWrite(state, () =>
             deps.writeBehind.persistContactAsync({
                 jid: lidJid,
                 phoneNumber: pnJid,
@@ -776,10 +853,10 @@ async function settleHistorySyncChunk(
     }
 
     if (deps.onPrivacyTokens && state.tokenConversations.length > 0) {
-        pushWrite(state, deps.onPrivacyTokens(state.tokenConversations))
+        pushWrite(state, () => deps.onPrivacyTokens!(state.tokenConversations))
     }
     if (deps.onNctSalt && state.nctSalt) {
-        pushWrite(state, deps.onNctSalt(state.nctSalt))
+        pushWrite(state, () => deps.onNctSalt!(state.nctSalt!))
     }
 }
 
@@ -818,18 +895,37 @@ function captureBoundaryMessage(
         recordBoundaryFamily(state, 'HISTORY_SYNC_MESSAGE', 2, 'METADATA_ONLY')
     }
     if (record.$unknowns?.length || !message || message.$unknowns?.length) {
-        boundary.blockedReason ??= 'unknown_or_missing_message_record'
+        boundary.blockedReason ??= record.$unknowns?.length
+            ? unknownFieldFailure(
+                  'unknown_or_missing_message_record',
+                  'HistorySyncMsg',
+                  record.$unknowns
+              )
+            : message?.$unknowns?.length
+              ? unknownFieldFailure(
+                    'unknown_or_missing_message_record',
+                    'WebMessageInfo',
+                    message.$unknowns
+                )
+              : historyFailure('unknown_or_missing_message_record', 'HistorySyncMsg', 1, null)
         return
     }
     recordBoundaryFamily(state, 'WEB_MESSAGE_INFO', 1, 'MESSAGE_OBSERVATIONS')
     if (message.key?.$unknowns?.length || message.message?.$unknowns?.length) {
-        boundary.blockedReason ??= 'unknown_message_fields'
+        boundary.blockedReason ??= message.key?.$unknowns?.length
+            ? unknownFieldFailure('unknown_message_fields', 'MessageKey', message.key.$unknowns)
+            : unknownFieldFailure('unknown_message_fields', 'Message', message.message?.$unknowns)
         return
     }
 
     const chatKind = classifyHistoryChat(conversationAddress)
     if (chatKind === 'UNKNOWN') {
-        boundary.blockedReason ??= 'unclassified_conversation_address'
+        boundary.blockedReason ??= historyFailure(
+            'unclassified_conversation_address',
+            'Conversation',
+            1,
+            2
+        )
         return
     }
 
@@ -842,7 +938,12 @@ function captureBoundaryMessage(
             message.key?.fromMe === null ||
             message.key?.fromMe === undefined)
     ) {
-        boundary.blockedReason ??= 'direct_message_missing_required_identity_or_content'
+        boundary.blockedReason ??= historyFailure(
+            'direct_message_missing_required_identity_or_content',
+            !message.message ? 'WebMessageInfo' : 'MessageKey',
+            !message.message ? 2 : !messageId ? 3 : 2,
+            null
+        )
         return
     }
     if (
@@ -851,7 +952,12 @@ function captureBoundaryMessage(
         message.key?.remoteJid !== undefined &&
         message.key.remoteJid !== conversationAddress
     ) {
-        boundary.blockedReason ??= 'direct_message_address_conflict'
+        boundary.blockedReason ??= historyFailure(
+            'direct_message_address_conflict',
+            'MessageKey',
+            1,
+            2
+        )
         return
     }
 
@@ -859,14 +965,23 @@ function captureBoundaryMessage(
     if (isDirect && message.message) {
         const contentType = getContentType(message.message)
         if (!contentType) {
-            boundary.blockedReason ??= 'direct_message_content_unclassified'
+            boundary.blockedReason ??= historyFailure(
+                'direct_message_content_unclassified',
+                'Message'
+            )
             return
         }
         if (
             contentType === 'extendedTextMessage' &&
             hasUnknownFieldsDeep(message.message.extendedTextMessage)
         ) {
-            boundary.blockedReason ??= 'unknown_extended_text_fields'
+            boundary.blockedReason ??= message.message.extendedTextMessage?.$unknowns?.length
+                ? unknownFieldFailure(
+                      'unknown_extended_text_fields',
+                      'Message.ExtendedTextMessage',
+                      message.message.extendedTextMessage.$unknowns
+                  )
+                : historyFailure('unknown_extended_text_fields')
             return
         }
         if (contentType === 'conversation' && typeof message.message.conversation === 'string') {
@@ -929,6 +1044,28 @@ function hasUnknownFieldsDeep(value: unknown, visited = new WeakSet<object>()): 
     return children.some((child) => hasUnknownFieldsDeep(child, visited))
 }
 
+/** Inspect only the first structural tag, never copy or retain an unknown field's value. */
+function unknownFieldFailure(
+    reason: HistoryFailureReason,
+    type: string,
+    unknowns: readonly Uint8Array[] | undefined
+): Error {
+    const bytes = unknowns?.[0]
+    let tag = 0
+    if (bytes) {
+        for (let index = 0; index < Math.min(5, bytes.length); index += 1) {
+            tag += (bytes[index] & 0x7f) * 2 ** (7 * index)
+            if (!(bytes[index] & 0x80)) {
+                if (tag >= 8 && tag <= 0xffff_ffff) {
+                    return historyFailure(reason, type, Math.floor(tag / 8), tag % 8)
+                }
+                break
+            }
+        }
+    }
+    return historyFailure(reason, type)
+}
+
 function classifyHistoryChat(address: string): WaHistorySyncChatKind {
     if (isGroupJid(address)) return 'GROUP'
     if (isBroadcastJid(address)) return 'BROADCAST'
@@ -953,9 +1090,19 @@ function recordRootFamily(
     recordBoundaryFamily(state, 'ROOT', fieldNumber, disposition)
     const expectedWire = rootFamilyWireType(fieldNumber)
     if (disposition === 'BLOCKED_UNDECIDED') {
-        boundary.blockedReason ??= 'unsupported_history_root_family'
+        boundary.blockedReason ??= historyFailure(
+            'unsupported_history_root_family',
+            'HistorySync',
+            fieldNumber,
+            wireType
+        )
     } else if (wireType !== expectedWire) {
-        boundary.blockedReason ??= 'malformed_history_root_family'
+        boundary.blockedReason ??= historyFailure(
+            'malformed_history_root_family',
+            'HistorySync',
+            fieldNumber,
+            wireType
+        )
     }
 }
 
@@ -997,7 +1144,12 @@ function recordConversationField(
     const boundary = state.boundary
     if (!boundary) return
     if (fieldNumber < 1 || fieldNumber > 63) {
-        boundary.blockedReason ??= 'unknown_conversation_field'
+        boundary.blockedReason ??= historyFailure(
+            'unknown_conversation_field',
+            'Conversation',
+            fieldNumber,
+            wireType
+        )
         return
     }
     recordBoundaryFamily(
@@ -1012,7 +1164,12 @@ function recordConversationField(
         (fieldNumber === CONVERSATION_FIELDS.ID || fieldNumber === CONVERSATION_FIELDS.MESSAGES) &&
         wireType !== PROTO_WIRE_TYPES.LEN
     ) {
-        boundary.blockedReason ??= 'malformed_conversation_field'
+        boundary.blockedReason ??= historyFailure(
+            'malformed_conversation_field',
+            'Conversation',
+            fieldNumber,
+            wireType
+        )
     }
 }
 
@@ -1029,13 +1186,16 @@ async function invokeBoundaryCallback(
 ): Promise<void> {
     throwIfAborted(context.signal)
     await abortable(
-        Promise.resolve().then(() => context.onBatch(batch, { signal: context.signal })),
+        Promise.resolve().then(() => {
+            throwIfAborted(context.signal)
+            return context.onBatch(batch, { signal: context.signal })
+        }),
         context.signal
     )
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
-    if (signal?.aborted) throw abortError(signal)
+    if (signal?.aborted) throw markHistoryFailure(abortError(signal), 'CANCELLED')
 }
 
 function abortError(signal: AbortSignal): Error {
@@ -1046,9 +1206,15 @@ function abortError(signal: AbortSignal): Error {
 
 function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
     if (!signal) return promise
-    if (signal.aborted) return Promise.reject(abortError(signal))
+    if (signal.aborted) {
+        promise.catch(() => undefined)
+        return Promise.reject(markHistoryFailure(abortError(signal), 'CANCELLED'))
+    }
     return new Promise<T>((resolve, reject) => {
-        const onAbort = (): void => reject(abortError(signal))
+        const onAbort = (): void => {
+            signal.removeEventListener('abort', onAbort)
+            reject(markHistoryFailure(abortError(signal), 'CANCELLED'))
+        }
         signal.addEventListener('abort', onAbort, { once: true })
         promise.then(resolve, reject).finally(() => {
             signal.removeEventListener('abort', onAbort)
@@ -1061,7 +1227,8 @@ function longToString(value: number | { toString(): string }): string {
 }
 
 /** The no-op handler keeps a queued rejection observed until the flush rejects on it. */
-function pushWrite(state: HistorySyncChunkState, write: Promise<void>): void {
+function pushWrite(state: HistorySyncChunkState, start: () => Promise<void>): void {
+    const write = state.writeBehind.ownHistoryOperation(start, state.maxOutstandingHistoryWrites)
     write.catch(() => undefined)
     state.pendingWrites[state.pendingWrites.length] = write
 }

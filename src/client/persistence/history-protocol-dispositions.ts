@@ -1,5 +1,10 @@
 import { setImmediate as yieldImmediate } from 'node:timers/promises'
 
+import {
+    historyFailure,
+    type HistoryFailureReason,
+    identifyHistoryFailure
+} from '@client/persistence/history-failure'
 import { isGroupJid, parseJidFull, splitJid } from '@protocol/jid'
 
 type FieldRule = string | { readonly enum: readonly number[] } | { readonly packed: FieldRule }
@@ -2179,8 +2184,8 @@ interface FieldSpan {
     readonly integer: bigint
 }
 
-function reject(category: string): never {
-    throw new Error(category)
+function reject(category: HistoryFailureReason): never {
+    throw historyFailure(category)
 }
 
 function checkAbort(ctx: WalkContext): void {
@@ -2309,7 +2314,7 @@ function validateInteger(rule: FieldRule, value: bigint): void {
     }
 }
 
-function unknownCategory(type: string): string {
+function unknownCategory(type: string): HistoryFailureReason {
     if (type === 'HistorySyncMsg' || type === 'WebMessageInfo')
         return 'unknown_or_missing_message_record'
     if (type === 'Message' || type === 'MessageKey') return 'unknown_message_fields'
@@ -2378,115 +2383,132 @@ async function walkMessage(
     quoted: boolean,
     target = 0
 ): Promise<{ readonly size: number; readonly changed: boolean }> {
-    checkAbort(ctx)
-    if (depth > MAX_DEPTH) reject('history_protocol_depth_limit')
-    const rules = PINNED_RULES[type]
-    if (!rules) reject('unsupported_history_protocol_type')
-    let group: Uint8Array | null = null
-    let size = 0
-    let changed = false
-    for (let cursor = start; cursor < end; ) {
-        await checkpoint(ctx)
-        const field = fieldSpan(bytes, cursor, end, ctx.validation.maxFieldBytes)
-        cursor = field.end
-        if (!ctx.output) ctx.validation.chargeField()
-        const rule = rules[field.number]
-        if (!rule) reject(unknownCategory(type))
-        const effective = typeof rule !== 'string' && 'packed' in rule ? rule.packed : rule
-        const packed = typeof rule !== 'string' && 'packed' in rule && field.wire === 2
-        if (field.wire !== scalarWire(effective) && !packed)
-            reject('malformed_history_protocol_field_wire')
-        if (packed) {
-            const expected = scalarWire(effective)
-            for (let at = field.payloadStart; at < field.end; ) {
-                await checkpoint(ctx)
-                if (expected === 0) {
-                    const item = varint(bytes, at, field.end)
-                    validateInteger(effective, item.value)
-                    at = item.end
-                } else {
-                    at += expected === 1 ? 8 : 4
-                    if (at > field.end) reject('malformed_history_protocol_packed')
-                }
-            }
-        } else if (field.wire === 0) validateInteger(effective, field.integer)
-        else if (effective === 'string' || effective === 'excludedCanonicalUrl') {
-            await validateUtf8(bytes, field.payloadStart, field.end, ctx)
-        } else if (effective === 'bytes') await scanBytes(ctx, field.end - field.payloadStart)
-        if (type === 'PastParticipants' && field.number === 1)
-            group = await validateGroup(bytes, field, group, ctx)
-        if (effective === 'excludedCanonicalUrl') {
-            changed = true
-            if (!ctx.output) {
-                if (quoted) ctx.quotedCount += 1
-                else ctx.outerCount += 1
-            }
-            continue
-        }
-        const child = typeof effective === 'string' ? PINNED_RULES[effective] : null
-        if (child) {
-            const childQuoted = quoted || (type === 'ContextInfo' && field.number === 3)
-            if (ctx.output) {
-                const fieldTarget = target
-                target = await copySpan(ctx, bytes, field.start, field.tagEnd, target)
-                const lengthStart = target
-                const oldWidth = field.payloadStart - field.tagEnd
-                target += oldWidth
-                const childStart = target
-                const childResult = await walkMessage(
-                    effective as string,
-                    bytes,
-                    field.payloadStart,
-                    field.end,
-                    ctx,
-                    depth + 1,
-                    childQuoted,
-                    target
-                )
-                target = childResult.size
-                if (!childResult.changed) {
-                    // Preserve even nonminimal framing in unrelated known child fields.
-                    target = await copySpan(ctx, bytes, field.start, field.end, fieldTarget)
-                    continue
-                }
-                changed = true
-                const prefixEnd = encodeLength(ctx.output, target - childStart, lengthStart)
-                const shift = childStart - prefixEnd
-                if (shift < 0) reject('history_protocol_projection_invariant')
-                if (shift) {
-                    for (let from = childStart; from < target; from += 4_096) {
-                        const stop = Math.min(target, from + 4_096)
-                        await checkpoint(ctx, stop - from)
-                        ctx.output.copyWithin(from - shift, from, stop)
+    let failureField: FieldSpan | null = null
+    try {
+        checkAbort(ctx)
+        if (depth > MAX_DEPTH) reject('history_protocol_depth_limit')
+        const rules = PINNED_RULES[type]
+        if (!rules) reject('unsupported_history_protocol_type')
+        let group: Uint8Array | null = null
+        let size = 0
+        let changed = false
+        for (let cursor = start; cursor < end; ) {
+            failureField = null
+            await checkpoint(ctx)
+            const field = fieldSpan(bytes, cursor, end, ctx.validation.maxFieldBytes)
+            failureField = field
+            cursor = field.end
+            if (!ctx.output) ctx.validation.chargeField()
+            const rule = rules[field.number]
+            if (!rule) reject(unknownCategory(type))
+            const effective = typeof rule !== 'string' && 'packed' in rule ? rule.packed : rule
+            const packed = typeof rule !== 'string' && 'packed' in rule && field.wire === 2
+            if (field.wire !== scalarWire(effective) && !packed)
+                reject('malformed_history_protocol_field_wire')
+            if (packed) {
+                const expected = scalarWire(effective)
+                for (let at = field.payloadStart; at < field.end; ) {
+                    await checkpoint(ctx)
+                    if (expected === 0) {
+                        const item = varint(bytes, at, field.end)
+                        validateInteger(effective, item.value)
+                        at = item.end
+                    } else {
+                        at += expected === 1 ? 8 : 4
+                        if (at > field.end) reject('malformed_history_protocol_packed')
                     }
-                    target -= shift
                 }
-            } else {
-                const childResult = await walkMessage(
-                    effective as string,
-                    bytes,
-                    field.payloadStart,
-                    field.end,
-                    ctx,
-                    depth + 1,
-                    childQuoted
-                )
-                if (!childResult.changed) {
-                    size += field.end - field.start
-                    continue
-                }
+            } else if (field.wire === 0) validateInteger(effective, field.integer)
+            else if (effective === 'string' || effective === 'excludedCanonicalUrl') {
+                await validateUtf8(bytes, field.payloadStart, field.end, ctx)
+            } else if (effective === 'bytes') await scanBytes(ctx, field.end - field.payloadStart)
+            if (type === 'PastParticipants' && field.number === 1)
+                group = await validateGroup(bytes, field, group, ctx)
+            if (effective === 'excludedCanonicalUrl') {
                 changed = true
-                const childSize = childResult.size
-                let width = 1
-                for (let value = childSize; value >= 128; value = Math.floor(value / 128))
-                    width += 1
-                size += field.tagEnd - field.start + width + childSize
+                if (!ctx.output) {
+                    if (quoted) ctx.quotedCount += 1
+                    else ctx.outerCount += 1
+                }
+                continue
             }
-        } else if (ctx.output) target = await copySpan(ctx, bytes, field.start, field.end, target)
-        else size += field.end - field.start
+            const child = typeof effective === 'string' ? PINNED_RULES[effective] : null
+            if (child) {
+                const childQuoted = quoted || (type === 'ContextInfo' && field.number === 3)
+                if (ctx.output) {
+                    const fieldTarget = target
+                    target = await copySpan(ctx, bytes, field.start, field.tagEnd, target)
+                    const lengthStart = target
+                    const oldWidth = field.payloadStart - field.tagEnd
+                    target += oldWidth
+                    const childStart = target
+                    const childResult = await walkMessage(
+                        effective as string,
+                        bytes,
+                        field.payloadStart,
+                        field.end,
+                        ctx,
+                        depth + 1,
+                        childQuoted,
+                        target
+                    )
+                    target = childResult.size
+                    if (!childResult.changed) {
+                        // Preserve even nonminimal framing in unrelated known child fields.
+                        target = await copySpan(ctx, bytes, field.start, field.end, fieldTarget)
+                        continue
+                    }
+                    changed = true
+                    const prefixEnd = encodeLength(ctx.output, target - childStart, lengthStart)
+                    const shift = childStart - prefixEnd
+                    if (shift < 0) reject('history_protocol_projection_invariant')
+                    if (shift) {
+                        for (let from = childStart; from < target; from += 4_096) {
+                            const stop = Math.min(target, from + 4_096)
+                            await checkpoint(ctx, stop - from)
+                            ctx.output.copyWithin(from - shift, from, stop)
+                        }
+                        target -= shift
+                    }
+                } else {
+                    const childResult = await walkMessage(
+                        effective as string,
+                        bytes,
+                        field.payloadStart,
+                        field.end,
+                        ctx,
+                        depth + 1,
+                        childQuoted
+                    )
+                    if (!childResult.changed) {
+                        size += field.end - field.start
+                        continue
+                    }
+                    changed = true
+                    const childSize = childResult.size
+                    let width = 1
+                    for (let value = childSize; value >= 128; value = Math.floor(value / 128))
+                        width += 1
+                    size += field.tagEnd - field.start + width + childSize
+                }
+            } else if (ctx.output)
+                target = await copySpan(ctx, bytes, field.start, field.end, target)
+            else size += field.end - field.start
+        }
+        if (type === 'PastParticipants' && !group) reject('invalid_history_group_address')
+        return { size: ctx.output ? target : size, changed }
+    } catch (error) {
+        // `type` comes exclusively from pinned source rules, never wire input.
+        if (Object.prototype.hasOwnProperty.call(PINNED_RULES, type)) {
+            identifyHistoryFailure(
+                error,
+                type,
+                failureField?.number ?? null,
+                failureField?.wire ?? null
+            )
+        }
+        throw error
     }
-    if (type === 'PastParticipants' && !group) reject('invalid_history_group_address')
-    return { size: ctx.output ? target : size, changed }
 }
 
 function walkContext(
@@ -2503,30 +2525,38 @@ export async function validateAcceptedHistoryRoot(
     raw: Uint8Array,
     validation: HistoryProtocolValidationContext
 ): Promise<void> {
-    const ctx = walkContext(validation)
-    await checkpoint(ctx)
-    const field = fieldSpan(raw, 0, raw.length, validation.maxFieldBytes)
-    if (field.number !== fieldNumber || field.wire !== wireType || field.end !== raw.length)
-        reject('malformed_history_root_family')
-    if (![8, 9, 10, 12, 13].includes(fieldNumber) || field.wire !== (fieldNumber === 10 ? 0 : 2))
-        reject('malformed_history_root_family')
-    if (fieldNumber === 10) validateInteger('uint32', field.integer)
-    else if (fieldNumber === 9) await scanBytes(ctx, field.end - field.payloadStart)
-    else
-        await walkMessage(
-            fieldNumber === 8
-                ? 'GlobalSettings'
-                : fieldNumber === 12
-                  ? 'PastParticipants'
-                  : 'CallLogRecord',
-            raw,
-            field.payloadStart,
-            field.end,
-            ctx,
-            0,
-            false
+    try {
+        const ctx = walkContext(validation)
+        await checkpoint(ctx)
+        const field = fieldSpan(raw, 0, raw.length, validation.maxFieldBytes)
+        if (field.number !== fieldNumber || field.wire !== wireType || field.end !== raw.length)
+            reject('malformed_history_root_family')
+        if (
+            ![8, 9, 10, 12, 13].includes(fieldNumber) ||
+            field.wire !== (fieldNumber === 10 ? 0 : 2)
         )
-    checkAbort(ctx)
+            reject('malformed_history_root_family')
+        if (fieldNumber === 10) validateInteger('uint32', field.integer)
+        else if (fieldNumber === 9) await scanBytes(ctx, field.end - field.payloadStart)
+        else
+            await walkMessage(
+                fieldNumber === 8
+                    ? 'GlobalSettings'
+                    : fieldNumber === 12
+                      ? 'PastParticipants'
+                      : 'CallLogRecord',
+                raw,
+                field.payloadStart,
+                field.end,
+                ctx,
+                0,
+                false
+            )
+        checkAbort(ctx)
+    } catch (error) {
+        identifyHistoryFailure(error, 'HistorySync', fieldNumber, wireType)
+        throw error
+    }
 }
 
 /** Validates all physical occurrences before decoding and strips only exact-type legacy URL fields. */

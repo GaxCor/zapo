@@ -336,7 +336,11 @@ export class WaMediaCrypto {
         const keys = WaMediaCrypto.deriveKeys(options.mediaType, options.mediaKey)
         const plaintext = new PassThrough()
         // Keep an early stream error observed until the caller attaches a consumer.
-        plaintext.on('error', () => undefined)
+        const observeEarlyError = (): void => undefined
+        plaintext.on('error', observeEarlyError)
+        if (options.mediaType === 'history') {
+            plaintext.once('close', () => plaintext.off('error', observeEarlyError))
+        }
         const metadata = pumpDecryption(encrypted, plaintext, keys, options)
         return { plaintext, metadata }
     }
@@ -464,6 +468,32 @@ async function endWritable(stream: Writable): Promise<void> {
     })
 }
 
+/** History-only backpressure: premature downstream close must release the pump. */
+async function writeHistoryChunk(stream: Writable, chunk: Uint8Array): Promise<void> {
+    if (stream.destroyed || stream.writableEnded) throw new Error('history plaintext closed')
+    if (chunk.byteLength === 0 || stream.write(chunk)) return
+    await new Promise<void>((resolve, reject) => {
+        let done = false
+        const finish = (error?: Error): void => {
+            if (done) return
+            done = true
+            stream.off('drain', onDrain)
+            stream.off('error', onError)
+            stream.off('close', onClose)
+            if (error) reject(error)
+            else resolve()
+        }
+        const onDrain = (): void => finish()
+        const onError = (error: Error): void => finish(error)
+        const onClose = (): void => finish(new Error('history plaintext closed'))
+        stream.once('drain', onDrain)
+        stream.once('error', onError)
+        stream.once('close', onClose)
+        if (stream.destroyed || stream.writableEnded) onClose()
+        else if (!stream.writableNeedDrain) onDrain()
+    })
+}
+
 async function pumpDecryption(
     encrypted: Readable,
     plaintext: PassThrough,
@@ -477,6 +507,17 @@ async function pumpDecryption(
     const trailingScratch = new Uint8Array(HMAC_TRUNCATED_SIZE)
     let trailingLength = 0
     let encryptedByteLength = 0
+    const history = options.mediaType === 'history'
+    let completed = false
+    const onDownstreamClose = (): void => {
+        if (!completed) encrypted.destroy(new Error('history plaintext terminated'))
+    }
+    if (history) {
+        plaintext.once('close', onDownstreamClose)
+        plaintext.once('error', onDownstreamClose)
+        if (plaintext.destroyed) onDownstreamClose()
+    }
+    const writePlaintext = history ? writeHistoryChunk : writeChunkToWritable
 
     const consumeCiphertext = async (part: Uint8Array): Promise<void> => {
         hmac.update(part)
@@ -484,7 +525,7 @@ async function pumpDecryption(
         if (dec.byteLength > 0) {
             const decBytes = toBytesView(dec)
             plainHash.update(decBytes)
-            await writeChunkToWritable(plaintext, decBytes)
+            await writePlaintext(plaintext, decBytes)
         }
     }
 
@@ -543,7 +584,7 @@ async function pumpDecryption(
         if (finalDec.byteLength > 0) {
             const bytes = toBytesView(finalDec)
             plainHash.update(bytes)
-            await writeChunkToWritable(plaintext, bytes)
+            await writePlaintext(plaintext, bytes)
         }
 
         const fileSha256 = toBytesView(plainHash.digest())
@@ -561,12 +602,19 @@ async function pumpDecryption(
             throw new Error('plaintext file hash mismatch')
         }
 
+        completed = true
         plaintext.end()
         return { fileSha256, fileEncSha256 }
     } catch (error) {
         const normalized = toError(error)
+        if (history) encrypted.destroy(normalized)
         plaintext.destroy(normalized)
         throw normalized
+    } finally {
+        if (history) {
+            plaintext.off('close', onDownstreamClose)
+            plaintext.off('error', onDownstreamClose)
+        }
     }
 }
 

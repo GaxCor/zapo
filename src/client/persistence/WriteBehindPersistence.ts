@@ -16,6 +16,7 @@ export interface WriteBehindDrainResult {
     readonly messages: BackgroundQueueFlushResult
     readonly threads: BackgroundQueueFlushResult
     readonly contacts: BackgroundQueueFlushResult
+    readonly history: BackgroundQueueFlushResult
     readonly flushed: number
     readonly remaining: number
 }
@@ -64,6 +65,68 @@ export class WriteBehindPersistence {
     }
     private readonly flushTimeoutMs: number
     private destroyed: boolean
+    private readonly historyOperations = new Map<Promise<void>, number>()
+    private historyOutstanding = 0
+    private readonly historyDrainWaiters = new Set<() => void>()
+    private historySettled = 0
+
+    /**
+     * Internal history ownership. Admission is checked before starting work so
+     * repeated failed jobs cannot create unbounded non-cancellable provider work.
+     * No live consumer is serialized behind this tracker.
+     */
+    public ownHistoryOperation(start: () => Promise<void>, maxOutstanding = 4_096): Promise<void> {
+        if (
+            !Number.isSafeInteger(maxOutstanding) ||
+            maxOutstanding < 1 ||
+            this.destroyed ||
+            this.historyOutstanding >= maxOutstanding
+        ) {
+            throw new Error('history private operation admission rejected')
+        }
+        const operation = start()
+        const previous = this.historyOperations.get(operation) ?? 0
+        this.historyOperations.set(operation, previous + 1)
+        this.historyOutstanding += 1
+        // A provider may share one promise across several started operations.
+        // Bound operation count but attach only one tracker observer per promise.
+        if (previous > 0) return operation
+        const settled = (): void => {
+            const count = this.historyOperations.get(operation)
+            if (count === undefined) return
+            this.historyOperations.delete(operation)
+            this.historyOutstanding -= count
+            this.historySettled += count
+            if (this.historyOperations.size === 0) {
+                for (const notify of this.historyDrainWaiters) notify()
+            }
+        }
+        // Keep ownership and a rejection observer until the provider truly settles.
+        operation.then(settled, settled)
+        return operation
+    }
+
+    /** Internal inspection for failure cleanup, with no new promise continuations. */
+    public historyOperationsSettled(operations: readonly Promise<void>[]): boolean {
+        return operations.every((operation) => !this.historyOperations.has(operation))
+    }
+
+    private drainHistoryOperations(timeoutMs: number): Promise<BackgroundQueueFlushResult> {
+        const before = this.historySettled
+        return new Promise((resolve) => {
+            const finish = (): void => {
+                clearTimeout(timer)
+                this.historyDrainWaiters.delete(finish)
+                resolve({
+                    flushed: this.historySettled - before,
+                    remaining: this.historyOutstanding
+                })
+            }
+            const timer = setTimeout(finish, Math.max(0, timeoutMs))
+            this.historyDrainWaiters.add(finish)
+            if (this.historyOperations.size === 0) finish()
+        })
+    }
 
     public constructor(
         stores: WriteBehindStores,
@@ -166,35 +229,40 @@ export class WriteBehindPersistence {
     }
 
     public async flush(timeoutMs: number = this.flushTimeoutMs): Promise<WriteBehindDrainResult> {
-        const [messages, threads, contacts] = await Promise.all([
+        const [messages, threads, contacts, history] = await Promise.all([
             this.queues.messages.flush(timeoutMs),
             this.queues.threads.flush(timeoutMs),
-            this.queues.contacts.flush(timeoutMs)
+            this.queues.contacts.flush(timeoutMs),
+            this.drainHistoryOperations(timeoutMs)
         ])
-        const result = this.toDrainResult(messages, threads, contacts)
+        const result = this.toDrainResult(messages, threads, contacts, history)
         if (result.remaining > 0) {
             this.logger.warn('write-behind flush finished with pending writes', {
                 messagesRemaining: messages.remaining,
                 threadsRemaining: threads.remaining,
-                contactsRemaining: contacts.remaining
+                contactsRemaining: contacts.remaining,
+                historyRemaining: result.history.remaining
             })
         }
         return result
     }
 
     public async destroy(timeoutMs: number = this.flushTimeoutMs): Promise<WriteBehindDrainResult> {
-        const [messages, threads, contacts] = await Promise.all([
+        this.destroyed = true
+        const [messages, threads, contacts, history] = await Promise.all([
             this.queues.messages.destroy(timeoutMs),
             this.queues.threads.destroy(timeoutMs),
-            this.queues.contacts.destroy(timeoutMs)
+            this.queues.contacts.destroy(timeoutMs),
+            this.drainHistoryOperations(timeoutMs)
         ])
         this.destroyed = true
-        const result = this.toDrainResult(messages, threads, contacts)
+        const result = this.toDrainResult(messages, threads, contacts, history)
         if (result.remaining > 0) {
             this.logger.warn('write-behind destroy finished with pending writes', {
                 messagesRemaining: messages.remaining,
                 threadsRemaining: threads.remaining,
-                contactsRemaining: contacts.remaining
+                contactsRemaining: contacts.remaining,
+                historyRemaining: result.history.remaining
             })
         }
         return result
@@ -203,14 +271,23 @@ export class WriteBehindPersistence {
     private toDrainResult(
         messages: BackgroundQueueFlushResult,
         threads: BackgroundQueueFlushResult,
-        contacts: BackgroundQueueFlushResult
+        contacts: BackgroundQueueFlushResult,
+        history: BackgroundQueueFlushResult
     ): WriteBehindDrainResult {
+        // A flush does not fence new registrations. Recheck actual ownership at
+        // return, not the possibly stale snapshot from the parallel drain start.
+        history = { ...history, remaining: this.historyOutstanding }
         return {
             messages,
             threads,
             contacts,
+            history,
             flushed: messages.flushed + threads.flushed + contacts.flushed,
-            remaining: messages.remaining + threads.remaining + contacts.remaining
+            // Queue entries and owned promise lifetimes are separate accounting
+            // units and may overlap. This conservative drain indicator is not
+            // a count of unique provider writes; zero requires both to settle.
+            remaining:
+                messages.remaining + threads.remaining + contacts.remaining + history.remaining
         }
     }
 }
