@@ -276,13 +276,31 @@ function validateHistoryBoundaryOptions(options: WaClientOptions): void {
     const MAX_TIMER_DELAY_MS = 2_147_483_647
     const history = options.history
     const limits = history?.boundaryLimits
-    if (history?.onBatch) {
+    if (history?.onBatch && history.onStream) {
+        throw new Error('history.onBatch and history.onStream are mutually exclusive')
+    }
+    if (history?.onStream) {
+        if (!history.streamLimits)
+            throw new Error('history.streamLimits are required with onStream')
+        for (const name of ['maxMessagesPerChunk', 'maxChunkBytes', 'maxParkedMessages'] as const) {
+            const value = history.streamLimits[name]
+            if (!Number.isSafeInteger(value) || value <= 0) {
+                throw new Error(`history.streamLimits.${name} must be a positive safe integer`)
+            }
+        }
+        if (history.streamLimits.maxChunkBytes < 2) {
+            throw new Error('history.streamLimits.maxChunkBytes must allow array framing')
+        }
+    } else if (history?.streamLimits) {
+        throw new Error('history.streamLimits require history.onStream')
+    }
+    if (history?.onBatch || history?.onStream) {
         if (history.enabled === false) {
-            throw new Error('history.onBatch cannot be configured when history.enabled is false')
+            throw new Error('history boundary cannot be configured when history.enabled is false')
         }
         if (!limits) {
             throw new Error(
-                'history.boundaryLimits are required when history.onBatch is configured'
+                'history.boundaryLimits are required when a history boundary is configured'
             )
         }
         const positive = (name: string, value: number): void => {
@@ -311,7 +329,7 @@ function validateHistoryBoundaryOptions(options: WaClientOptions): void {
             )
         }
     } else if (limits) {
-        throw new Error('history.boundaryLimits require history.onBatch')
+        throw new Error('history.boundaryLimits require history.onBatch or history.onStream')
     }
 }
 
@@ -1123,7 +1141,7 @@ export function buildWaClientDependencies(input: {
                 .handleIncomingMessageEvent(event)
                 .catch((err) => runtime.handleError(toError(err)))
         },
-        ...(options.history?.onBatch
+        ...(options.history?.onBatch || options.history?.onStream
             ? {
                   scheduleHistorySync: (
                       event: WaIncomingMessageEvent,

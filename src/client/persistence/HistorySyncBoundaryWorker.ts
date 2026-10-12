@@ -262,12 +262,10 @@ export class HistorySyncBoundaryWorker {
                     : false
             },
             onSettled: () => {
-                const lifecycleOwner = owner
-                const settledWork = trackedWork
-                owner = null
-                if (!settledWork) return
-                trackedWork = null
-                lifecycleOwner?.settleCallback(settledWork)
+                if (!trackedWork) return
+                // A v2 job invokes sequential callbacks. Retain only this one job's
+                // lifecycle until run.finally detaches it, never completed payloads.
+                owner?.settleCallback(trackedWork)
             },
             detach: () => {
                 trackedWork = null
@@ -277,7 +275,12 @@ export class HistorySyncBoundaryWorker {
     }
 
     private startCallback(work: ActiveHistoryWork): boolean {
-        if (this.status === 'FAULTED' || work.controller.signal.aborted || !this.active.has(work)) {
+        if (
+            this.status === 'FAULTED' ||
+            work.controller.signal.aborted ||
+            work.callbackPending ||
+            !this.active.has(work)
+        ) {
             return false
         }
         if (performance.now() >= work.deadlineAt) {

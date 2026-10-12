@@ -9,6 +9,9 @@ export type {
     WaDeleteMessageForMeOptions,
     WaHistorySyncBatchHandler,
     WaHistorySyncBatchV1,
+    WaHistorySyncStreamEventV2,
+    WaHistorySyncStreamHandler,
+    WaHistorySyncStreamLimits,
     WaHistorySyncFamilyDisposition,
     WaLogoutStoreClearOptions
 } from '@client/types'

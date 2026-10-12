@@ -145,6 +145,8 @@ Each package's README has the install + config + integration notes.
 
 ## Documentation
 
+- **[Fork history boundary v2 candidate](docs/HISTORY_STREAM_V2.md)** - opt-in
+  provisional capture contract, evidence and remaining adoption gates; not a release
 - **[zapo.to](https://zapo.to/)** - guides, full API reference, examples,
   protocol notes ([llms.txt](https://zapo.to/llms.txt) index or
   [llms-full.txt](https://zapo.to/llms-full.txt) for LLM context)

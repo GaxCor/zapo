@@ -42,7 +42,10 @@ import type {
 import type {
     WaClientEventMap,
     WaClientOptions,
+    WaHistorySyncBatchContext,
+    WaHistorySyncBatchV1,
     WaHistorySyncBoundaryState,
+    WaHistorySyncStreamEventV2,
     WaIgnoreKey,
     WaIgnoreKeyPredicate,
     WaIncomingMessageEvent,
@@ -152,7 +155,10 @@ class WaClientImpl extends EventEmitter {
         this.appStateSync = dependencies.appStateSync
         this.mediaTransfer = dependencies.mediaTransfer
         const historyOptions = this.options.history
-        if (historyOptions?.onBatch && historyOptions.boundaryLimits) {
+        if (
+            (historyOptions?.onBatch || historyOptions?.onStream) &&
+            historyOptions.boundaryLimits
+        ) {
             this.historyBoundaryWorker = new HistorySyncBoundaryWorker(
                 historyOptions.boundaryLimits,
                 (notification, signal, receipt, callbackLifecycle) =>
@@ -325,7 +331,7 @@ class WaClientImpl extends EventEmitter {
         }
         try {
             if (
-                this.options.history?.onBatch &&
+                (this.options.history?.onBatch || this.options.history?.onStream) &&
                 event.message?.protocolMessage?.type ===
                     proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION
             ) {
@@ -502,8 +508,36 @@ class WaClientImpl extends EventEmitter {
         callbackLifecycle: HistorySyncCallbackLifecycle
     ): Promise<void> {
         const history = this.options.history
-        if (!history?.onBatch || !history.boundaryLimits) {
+        if ((!history?.onBatch && !history?.onStream) || !history.boundaryLimits) {
             throw new Error('history boundary is not configured')
+        }
+        const invoke = async (
+            payload: WaHistorySyncBatchV1 | WaHistorySyncStreamEventV2,
+            context: WaHistorySyncBatchContext
+        ): Promise<void> => {
+            if (!callbackLifecycle.onStart()) {
+                const error =
+                    signal.reason instanceof Error
+                        ? signal.reason
+                        : historyFailure('CALLBACK_ADMISSION_REJECTED')
+                throw markHistoryFailure(
+                    error,
+                    'CALLBACK_ADMISSION_REJECTED',
+                    'CALLBACK_ADMISSION_REJECTED'
+                )
+            }
+            try {
+                if (payload.version === 1) await history.onBatch!(payload, context)
+                else await history.onStream!(payload, context)
+            } finally {
+                callbackLifecycle.onSettled()
+            }
+            if (signal.aborted) {
+                throw signal.reason instanceof Error
+                    ? signal.reason
+                    : new Error('history boundary was cancelled')
+            }
+            if (payload.version === 1 || payload.type === 'SEAL') receipt.complete()
         }
         await processHistorySyncNotification(
             {
@@ -527,30 +561,9 @@ class WaClientImpl extends EventEmitter {
             {
                 limits: history.boundaryLimits,
                 signal,
-                onBatch: async (batch, context) => {
-                    if (!callbackLifecycle.onStart()) {
-                        const error =
-                            signal.reason instanceof Error
-                                ? signal.reason
-                                : historyFailure('CALLBACK_ADMISSION_REJECTED')
-                        throw markHistoryFailure(
-                            error,
-                            'CALLBACK_ADMISSION_REJECTED',
-                            'CALLBACK_ADMISSION_REJECTED'
-                        )
-                    }
-                    try {
-                        await history.onBatch!(batch, context)
-                    } finally {
-                        callbackLifecycle.onSettled()
-                    }
-                    if (signal.aborted) {
-                        throw signal.reason instanceof Error
-                            ? signal.reason
-                            : new Error('history boundary was cancelled')
-                    }
-                    receipt.complete()
-                }
+                ...(history.onStream
+                    ? { onStream: invoke, streamLimits: history.streamLimits }
+                    : { onBatch: invoke })
             }
         )
     }

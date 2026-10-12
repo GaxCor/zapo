@@ -10,6 +10,7 @@ import {
     prepareBoundaryHistoryRecord,
     validateAcceptedHistoryRoot
 } from '@client/persistence/history-protocol-dispositions'
+import { HistorySyncStreamV2 } from '@client/persistence/HistorySyncStreamV2'
 import type { WriteBehindPersistence } from '@client/persistence/WriteBehindPersistence'
 import type {
     WaClientEventMap,
@@ -18,7 +19,9 @@ import type {
     WaHistorySyncChatKind,
     WaHistorySyncChunkEvent,
     WaHistorySyncFamilyDisposition,
-    WaHistorySyncMessageObservation
+    WaHistorySyncMessageObservation,
+    WaHistorySyncStreamHandler,
+    WaHistorySyncStreamLimits
 } from '@client/types'
 import type { Logger } from '@infra/log/types'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
@@ -122,13 +125,17 @@ interface ParkedHistoryMessage {
 interface HistoryBoundaryMessageContext {
     readonly limits: WaHistorySyncBoundaryLimits
     readonly signal: AbortSignal
-    readonly onBatch: WaHistorySyncBatchHandler
+    readonly onBatch?: WaHistorySyncBatchHandler
+    readonly onStream?: WaHistorySyncStreamHandler
+    readonly streamLimits?: WaHistorySyncStreamLimits
 }
 
 interface HistoryBoundaryCapture {
     readonly context: HistoryBoundaryMessageContext
     readonly notification: Proto.Message.IHistorySyncNotification
     readonly observations: WaHistorySyncMessageObservation[]
+    readonly stream?: HistorySyncStreamV2
+    observationCount: number
     readonly familyDispositions: Map<string, WaHistorySyncFamilyDisposition>
     readonly metadataConflicts: Set<
         'notification_payload_chunk_order_mismatch' | 'notification_payload_progress_mismatch'
@@ -173,9 +180,10 @@ export async function runHistorySyncNotification(
 }
 
 /**
- * Applies one history sync chunk while it downloads, descending into
- * `conversations` so peak memory tracks the largest single message and not the
- * chunk. Chunk-wide records settle after the stream, once every LID mapping is in.
+ * Descends into conversations while downloading. v1 retains all normalized
+ * observations; v2 awaits bounded provisional observation chunks. Deferred private
+ * writes and batch metadata still retain a bounded source unit in both modes;
+ * this initial v2 slice is not a constant-space source implementation.
  */
 export async function processHistorySyncNotification(
     deps: WaHistorySyncDeps,
@@ -245,6 +253,16 @@ export async function processHistorySyncNotification(
                       context: boundaryContext,
                       notification,
                       observations: [],
+                      observationCount: 0,
+                      ...(boundaryContext.onStream && boundaryContext.streamLimits
+                          ? {
+                                stream: new HistorySyncStreamV2(
+                                    boundaryContext.onStream,
+                                    boundaryContext.streamLimits,
+                                    boundaryContext.signal
+                                )
+                            }
+                          : {}),
                       familyDispositions: new Map(),
                       metadataConflicts: new Set(),
                       deferredMessageWrites: [],
@@ -265,6 +283,11 @@ export async function processHistorySyncNotification(
     let phase: HistoryFailureReason = 'WALK_FAILED'
     try {
         throwIfAborted(boundaryContext?.signal)
+        if (state.boundary?.stream) {
+            phase = 'CALLBACK_REJECTED'
+            await state.boundary.stream.begin(projectNotification(notification))
+        }
+        phase = 'WALK_FAILED'
         await consumeHistorySyncStream(deps, blob.inflated, state)
 
         phase = 'VERIFICATION_REJECTED'
@@ -283,29 +306,9 @@ export async function processHistorySyncNotification(
                 )
             }
             phase = 'BATCH_PROJECTION_FAILED'
-            const batch = {
-                version: 1 as const,
+            const manifest = {
                 sourceHistoryCompleteness: 'UNKNOWN' as const,
-                notification: {
-                    syncType,
-                    ...(notification.chunkOrder !== null && notification.chunkOrder !== undefined
-                        ? { chunkOrder: notification.chunkOrder }
-                        : {}),
-                    ...(notification.progress !== null && notification.progress !== undefined
-                        ? { progress: notification.progress }
-                        : {}),
-                    ...(notification.originalMessageId
-                        ? { originalMessageId: notification.originalMessageId }
-                        : {}),
-                    ...(notification.oldestMsgInChunkTimestampSec !== null &&
-                    notification.oldestMsgInChunkTimestampSec !== undefined
-                        ? {
-                              oldestMsgInChunkTimestampSec: longToString(
-                                  notification.oldestMsgInChunkTimestampSec
-                              )
-                          }
-                        : {})
-                },
+                notification: projectNotification(notification),
                 decoded: {
                     ...(state.boundary.decodedSyncType !== null
                         ? { syncType: state.boundary.decodedSyncType }
@@ -316,11 +319,18 @@ export async function processHistorySyncNotification(
                 parseReachedEof: true as const,
                 payloadIntegrityVerified: true as const,
                 sourceFamilyDispositions: toFamilyDispositions(state.boundary),
-                metadataConflicts: [...state.boundary.metadataConflicts].sort(),
-                messageObservations: state.boundary.observations
+                metadataConflicts: [...state.boundary.metadataConflicts].sort()
             }
             phase = 'CALLBACK_REJECTED'
-            await invokeBoundaryCallback(state.boundary.context, batch)
+            if (state.boundary.stream) {
+                await state.boundary.stream.seal(manifest)
+            } else {
+                await invokeBoundaryCallback(state.boundary.context, {
+                    version: 1,
+                    ...manifest,
+                    messageObservations: state.boundary.observations
+                })
+            }
             phase = 'PRIVATE_SETTLEMENT_REJECTED'
             for (const persist of state.boundary.deferredMessageWrites) {
                 pushWrite(state, persist)
@@ -366,6 +376,15 @@ export async function processHistorySyncNotification(
         )
         markHistoryFailure(error, phase, 'CLEANUP_CANCEL_REQUESTED')
         blob.cancel()
+        if (state.boundary?.stream) {
+            try {
+                await state.boundary.stream.abort()
+            } catch {
+                // The original capture rejection retains authority. No exception
+                // text or source values from application cleanup reach diagnostics.
+                deps.logger.debug('history stream abort notification rejected')
+            }
+        }
         // Non-cancellable provider work already has private ownership. Do not
         // attach an abandoned allSettled continuation for every failed job.
         markHistoryFailure(error, phase, 'CLEANUP_WRITES_WAIT')
@@ -483,15 +502,24 @@ async function consumeHistorySyncStream(
                 }
                 if (state.boundary) {
                     if (
-                        state.boundary.observations.length + state.boundaryParkedRecords.length >=
+                        state.boundary.observationCount + state.boundaryParkedRecords.length >=
                         state.boundary.context.limits.maxMessagesPerBatch
                     ) {
                         throw new Error('history boundary batch exceeds configured message limit')
                     }
                     if (!threadJid || state.boundaryParkedRecords.length > 0) {
+                        if (
+                            state.boundary.context.streamLimits &&
+                            state.boundaryParkedRecords.length >=
+                                state.boundary.context.streamLimits.maxParkedMessages
+                        ) {
+                            throw new Error(
+                                'history stream exceeds configured parked-message limit'
+                            )
+                        }
                         state.boundaryParkedRecords.push(recordBytes.slice())
                     } else {
-                        captureBoundaryMessage(
+                        await captureBoundaryMessage(
                             state,
                             recordBytes,
                             threadJid,
@@ -661,7 +689,7 @@ async function closeConversation(
             )
         }
         for (const record of boundaryRecords) {
-            captureBoundaryMessage(state, record, resolvedJid, conversationOrdinal)
+            await captureBoundaryMessage(state, record, resolvedJid, conversationOrdinal)
         }
     }
 
@@ -880,12 +908,12 @@ function readHistoryMessage(record: Uint8Array): ParkedHistoryMessage | null {
     }
 }
 
-function captureBoundaryMessage(
+async function captureBoundaryMessage(
     state: HistorySyncChunkState,
     recordBytes: Uint8Array,
     conversationAddress: string,
     conversationOrdinal: number
-): void {
+): Promise<void> {
     const boundary = state.boundary
     if (!boundary) return
     const record = proto.HistorySyncMsg.decode(recordBytes)
@@ -997,7 +1025,7 @@ function captureBoundaryMessage(
     }
 
     const observation: WaHistorySyncMessageObservation = {
-        ordinal: boundary.observations.length + 1,
+        ordinal: boundary.observationCount + 1,
         conversationOrdinal,
         chatKind,
         disposition:
@@ -1025,7 +1053,39 @@ function captureBoundaryMessage(
             : {}),
         content
     }
-    boundary.observations.push(observation)
+    boundary.observationCount += 1
+    if (boundary.stream) {
+        await boundary.stream.append(observation)
+    } else {
+        boundary.observations.push(observation)
+    }
+}
+
+function projectNotification(
+    notification: Proto.Message.IHistorySyncNotification
+): Parameters<WaHistorySyncBatchHandler>[0]['notification'] {
+    return {
+        ...(notification.syncType !== null && notification.syncType !== undefined
+            ? { syncType: notification.syncType }
+            : {}),
+        ...(notification.chunkOrder !== null && notification.chunkOrder !== undefined
+            ? { chunkOrder: notification.chunkOrder }
+            : {}),
+        ...(notification.progress !== null && notification.progress !== undefined
+            ? { progress: notification.progress }
+            : {}),
+        ...(notification.originalMessageId
+            ? { originalMessageId: notification.originalMessageId }
+            : {}),
+        ...(notification.oldestMsgInChunkTimestampSec !== null &&
+        notification.oldestMsgInChunkTimestampSec !== undefined
+            ? {
+                  oldestMsgInChunkTimestampSec: longToString(
+                      notification.oldestMsgInChunkTimestampSec
+                  )
+              }
+            : {})
+    }
 }
 
 function hasUnknownFieldsDeep(value: unknown, visited = new WeakSet<object>()): boolean {
@@ -1188,6 +1248,7 @@ async function invokeBoundaryCallback(
     await abortable(
         Promise.resolve().then(() => {
             throwIfAborted(context.signal)
+            if (!context.onBatch) throw new Error('history batch handler is not configured')
             return context.onBatch(batch, { signal: context.signal })
         }),
         context.signal

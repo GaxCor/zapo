@@ -165,7 +165,7 @@ export interface WaClientOptions extends WaAuthClientOptions, WaAuthSocketOption
      * `enabled: false` to drop them; `requireFullSync: true` asks the
      * primary device for a full history download instead of just recent;
      * `groupBundles: true` opts into the group-history bundle a member may
-     * share after somebody joins a group. The optional `onBatch` boundary
+     * share after somebody joins a group. The optional `onBatch`/`onStream` boundary
      * replaces the shared-frame history path and requires explicit finite
      * caller-selected limits; callback fulfillment gates ordinary delivery.
      */
@@ -361,8 +361,30 @@ export interface WaHistorySyncOptions {
      * receipt; the application should make durable acceptance idempotent.
      */
     readonly onBatch?: WaHistorySyncBatchHandler
-    /** Required with `onBatch`; every value is caller-selected, finite, and has no library default. */
+    /**
+     * Opt-in v2 incremental normalized capture, mutually exclusive with `onBatch`.
+     * BEGIN/CHUNK are provisional: persist into an isolated BUILDING capture, never
+     * canonical messages. Only SEAL follows verified EOF; its fulfillment must mean
+     * all chunks and the complete verified manifest are durably accepted. Only that
+     * fulfillment can authorize the ordinary source receipt. Each callback is awaited
+     * for backpressure and shares the job deadline/cancellation/fault rules of v1.
+     * ABORT is best-effort for failed captures, never receipt authority. On cancellation
+     * a pending callback can outlive the job, so no concurrent ABORT is invoked; recover
+     * unsealed captures durably after restart. This is not source pagination.
+     */
+    readonly onStream?: WaHistorySyncStreamHandler
+    /** Required with `onStream`; no implicit chunk/parking budgets. */
+    readonly streamLimits?: WaHistorySyncStreamLimits
+    /** Required with either boundary; caller-selected finite values, no library defaults. */
     readonly boundaryLimits?: WaHistorySyncBoundaryLimits
+}
+
+export interface WaHistorySyncStreamLimits {
+    readonly maxMessagesPerChunk: number
+    /** UTF-8 JSON size of one normalized message-observation array, including brackets/commas. */
+    readonly maxChunkBytes: number
+    /** Records preceding Conversation.id are bounded separately, never silently dropped. */
+    readonly maxParkedMessages: number
 }
 
 export interface WaHistorySyncBoundaryLimits {
@@ -374,7 +396,7 @@ export interface WaHistorySyncBoundaryLimits {
     readonly maxQueuedBytes: number
     /** Per-job retained-notification and declared encrypted-payload ceiling. */
     readonly maxBatchBytes: number
-    /** Maximum message observations retained for one job. */
+    /** Maximum message observations admitted for one job (retained whole only by v1). */
     readonly maxMessagesPerBatch: number
     /** Maximum inspected protobuf fields, including boundary-validated nested fields, for one job. */
     readonly maxSourceRecordsPerBatch: number
@@ -456,6 +478,48 @@ export interface WaHistorySyncBatchV1 {
 export interface WaHistorySyncBatchContext {
     readonly signal: AbortSignal
 }
+
+/**
+ * Delivery-scoped v2 capture. captureId is opaque, not a server cursor or replay key.
+ * No complete message array is delivered at SEAL. A rejected/unsealed capture is
+ * incomplete, even if source progress says 100. v1 content projection is preserved
+ * in this initial streaming slice; rich projection requires its separate fixtures.
+ * Private source fields must not be logged or exposed as diagnostics.
+ */
+export type WaHistorySyncStreamEventV2 =
+    | {
+          readonly version: 2
+          readonly type: 'BEGIN'
+          readonly captureId: string
+          readonly sourceHistoryCompleteness: 'UNKNOWN'
+          readonly notification: WaHistorySyncBatchV1['notification']
+      }
+    | {
+          readonly version: 2
+          readonly type: 'CHUNK'
+          readonly captureId: string
+          readonly sequence: number
+          readonly messageObservations: readonly WaHistorySyncMessageObservation[]
+      }
+    | {
+          readonly version: 2
+          readonly type: 'SEAL'
+          readonly captureId: string
+          readonly chunkCount: number
+          readonly messageObservationCount: number
+          readonly manifest: Omit<WaHistorySyncBatchV1, 'version' | 'messageObservations'>
+      }
+    | {
+          readonly version: 2
+          readonly type: 'ABORT'
+          readonly captureId: string
+          readonly reason: 'capture_failed'
+      }
+
+export type WaHistorySyncStreamHandler = (
+    event: WaHistorySyncStreamEventV2,
+    context: WaHistorySyncBatchContext
+) => Promise<void>
 
 /** Sanitized result when a durable-history boundary item cannot be accepted. */
 export interface WaHistorySyncBoundaryFailureEvent {
