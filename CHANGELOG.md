@@ -1,5 +1,19 @@
 # zapo-js
 
+## 1.9.1
+
+### Minor Changes
+
+- Project-controlled CRM history candidate from the accepted 1.8.2 source lineage:
+  opt-in provisional streaming, rich metadata/protected descriptors, bounded source
+  facts and exact root15 PHONE/LID observations. Default/v1 behavior is preserved.
+- Independent resource ceilings and optional private-mailbox disabling, with local
+  encrypted flow and synthetic source-memory evidence. No new wire/crypto/receipt,
+  account-completeness, real-history or application acceptance claim.
+
+This distinct candidate identity is not fork master@1.9.0 adoption, an npm release
+or a replacement labelled as the previously accepted 1.8.2 archive.
+
 ## 1.8.2
 
 ### Patch Changes

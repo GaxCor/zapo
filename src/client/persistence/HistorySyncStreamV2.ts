@@ -1,8 +1,11 @@
 import { randomUUID } from 'node:crypto'
 
+import type { HistorySourceFactInput } from '@client/persistence/history-facts-v2'
 import type {
     WaHistorySyncBatchV1,
     WaHistorySyncMessageObservationV2,
+    WaHistorySyncSourceEnvelopeV2,
+    WaHistorySyncSourceFactV2,
     WaHistorySyncStreamEventV2,
     WaHistorySyncStreamHandler,
     WaHistorySyncStreamLimits
@@ -16,6 +19,10 @@ export class HistorySyncStreamV2 {
     private pendingBytes = 2
     private chunkCount = 0
     private messageCount = 0
+    private facts: WaHistorySyncSourceFactV2[] = []
+    private factBytes = 2
+    private factCount = 0
+    private factChunks = 0
     private began = false
     private terminal = false
 
@@ -23,8 +30,15 @@ export class HistorySyncStreamV2 {
         private readonly handler: WaHistorySyncStreamHandler,
         private readonly limits: WaHistorySyncStreamLimits,
         private readonly signal: AbortSignal,
-        private readonly contentProfile: 'TEXT_V1' | 'RICH_V2' = 'TEXT_V1'
-    ) {}
+        private readonly contentProfile: 'TEXT_V1' | 'RICH_V2' = 'TEXT_V1',
+        private readonly factProfile?: 'EXACT_V1',
+        private readonly sourceEnvelope: WaHistorySyncSourceEnvelopeV2 = {
+            origin: 'UNVERIFIED_SOURCE'
+        }
+    ) {
+        // Callback code must not mutate envelope provenance between BEGIN and SEAL.
+        this.sourceEnvelope = Object.freeze({ ...sourceEnvelope })
+    }
 
     public async begin(notification: WaHistorySyncBatchV1['notification']): Promise<void> {
         if (this.began || this.terminal) throw new Error('history stream already began')
@@ -35,7 +49,10 @@ export class HistorySyncStreamV2 {
             captureId: this.captureId,
             sourceHistoryCompleteness: 'UNKNOWN',
             notification,
-            ...(this.contentProfile === 'RICH_V2' ? { contentProfile: 'RICH_V2' as const } : {})
+            ...(this.contentProfile === 'RICH_V2' ? { contentProfile: 'RICH_V2' as const } : {}),
+            ...(this.factProfile
+                ? { factProfile: this.factProfile, sourceEnvelope: this.sourceEnvelope }
+                : {})
         })
     }
 
@@ -62,12 +79,31 @@ export class HistorySyncStreamV2 {
         if (this.pending.length >= this.limits.maxMessagesPerChunk) await this.flush()
     }
 
+    public async appendFact(fact: HistorySourceFactInput): Promise<void> {
+        this.assertBuilding()
+        if (!this.factProfile || !this.limits.facts) throw new Error('history facts not configured')
+        const row = { ...fact, ordinal: this.factCount + 1 } as WaHistorySyncSourceFactV2
+        const bytes = TEXT_ENCODER.encode(JSON.stringify(row)).byteLength
+        if (bytes + 2 > this.limits.facts.maxFactChunkBytes)
+            throw new Error('history fact exceeds configured fact-chunk byte limit')
+        if (
+            this.factBytes + bytes + (this.facts.length ? 1 : 0) >
+            this.limits.facts.maxFactChunkBytes
+        )
+            await this.flushFacts()
+        this.factBytes += bytes + (this.facts.length ? 1 : 0)
+        this.facts.push(row)
+        this.factCount++
+        if (this.facts.length >= this.limits.facts.maxFactsPerChunk) await this.flushFacts()
+    }
+
     /** Only the parser may call this after EOF, integrity verification and all source gates. */
     public async seal(
         manifest: Omit<WaHistorySyncBatchV1, 'version' | 'messageObservations'>
     ): Promise<void> {
         this.assertBuilding()
         await this.flush()
+        await this.flushFacts()
         await this.dispatch({
             version: 2,
             type: 'SEAL',
@@ -75,7 +111,15 @@ export class HistorySyncStreamV2 {
             chunkCount: this.chunkCount,
             messageObservationCount: this.messageCount,
             manifest,
-            ...(this.contentProfile === 'RICH_V2' ? { contentProfile: 'RICH_V2' as const } : {})
+            ...(this.contentProfile === 'RICH_V2' ? { contentProfile: 'RICH_V2' as const } : {}),
+            ...(this.factProfile
+                ? {
+                      factProfile: this.factProfile,
+                      factChunkCount: this.factChunks,
+                      factObservationCount: this.factCount,
+                      sourceEnvelope: this.sourceEnvelope
+                  }
+                : {})
         })
         this.terminal = true
     }
@@ -84,6 +128,8 @@ export class HistorySyncStreamV2 {
     public async abort(): Promise<void> {
         this.pending = []
         this.pendingBytes = 2
+        this.facts = []
+        this.factBytes = 2
         if (!this.began || this.terminal) return
         this.terminal = true
         if (this.signal.aborted) return
@@ -113,6 +159,21 @@ export class HistorySyncStreamV2 {
             messageObservations: observations
         })
         this.chunkCount += 1
+    }
+
+    private async flushFacts(): Promise<void> {
+        if (!this.facts.length) return
+        const facts = this.facts
+        this.facts = []
+        this.factBytes = 2
+        await this.dispatch({
+            version: 2,
+            type: 'FACT_CHUNK',
+            captureId: this.captureId,
+            sequence: this.factChunks + 1,
+            sourceFacts: facts
+        })
+        this.factChunks++
     }
 
     private throwIfAborted(): void {

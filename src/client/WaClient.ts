@@ -45,6 +45,7 @@ import type {
     WaHistorySyncBatchContext,
     WaHistorySyncBatchV1,
     WaHistorySyncBoundaryState,
+    WaHistorySyncSourceEnvelopeV2,
     WaHistorySyncStreamEventV2,
     WaIgnoreKey,
     WaIgnoreKeyPredicate,
@@ -161,12 +162,13 @@ class WaClientImpl extends EventEmitter {
         ) {
             this.historyBoundaryWorker = new HistorySyncBoundaryWorker(
                 historyOptions.boundaryLimits,
-                (notification, signal, receipt, callbackLifecycle) =>
+                (notification, signal, receipt, callbackLifecycle, sourceEnvelope) =>
                     this.processHistorySyncBoundary(
                         notification,
                         signal,
                         receipt,
-                        callbackLifecycle
+                        callbackLifecycle,
+                        sourceEnvelope
                     ),
                 (reason) => {
                     this.emit('history_sync_boundary_failure', { reason })
@@ -498,7 +500,16 @@ class WaClientImpl extends EventEmitter {
             notification,
             receipt,
             () => this.leaveIncomingHandler(),
-            hasUnsupportedEnvelopeUnknowns
+            hasUnsupportedEnvelopeUnknowns,
+            this.options.history?.streamFacts
+                ? {
+                      origin: event.key.fromMe
+                          ? 'SELF_ACCOUNT_INCOMING_KEY'
+                          : 'OTHER_ACCOUNT_INCOMING_KEY',
+                      sourceMessageId: event.key.id,
+                      senderDevice: event.key.senderDevice
+                  }
+                : undefined
         )
     }
 
@@ -506,7 +517,8 @@ class WaClientImpl extends EventEmitter {
         notification: Proto.Message.IHistorySyncNotification,
         signal: AbortSignal,
         receipt: WaDeferredHistoryReceipt,
-        callbackLifecycle: HistorySyncCallbackLifecycle
+        callbackLifecycle: HistorySyncCallbackLifecycle,
+        sourceEnvelope?: WaHistorySyncSourceEnvelopeV2
     ): Promise<void> {
         const history = this.options.history
         if ((!history?.onBatch && !history?.onStream) || !history.boundaryLimits) {
@@ -567,6 +579,8 @@ class WaClientImpl extends EventEmitter {
                           onStream: invoke,
                           streamLimits: history.streamLimits,
                           streamContent: history.streamContent,
+                          streamFacts: history.streamFacts,
+                          sourceEnvelope,
                           privateMailbox: history.privateMailbox
                       }
                     : { onBatch: invoke })

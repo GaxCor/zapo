@@ -1,9 +1,17 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { gzipSync } from 'node:zlib'
 
-import { createNoopLogger, createStore, WaClient, type WaHistorySyncStreamEventV2 } from 'zapo-js'
+import {
+    createNoopLogger,
+    createStore,
+    proto,
+    WaClient,
+    type WaHistorySyncStreamEventV2
+} from 'zapo-js'
 
 import { FakeWaServer } from '../api/FakeWaServer'
+import { parsePairingQrString } from '../protocol/auth/pair-device'
 
 function deferred() {
     let resolve!: () => void
@@ -35,9 +43,12 @@ async function within(promise: Promise<void>, stage: string | (() => string)): P
     }
 }
 
-for (const rich of [false, true]) {
+for (const profile of ['TEXT_V1', 'RICH_V2', 'RICH_FACTS', 'SELF_FACTS'] as const) {
+    const rich = profile !== 'TEXT_V1'
+    const facts = profile === 'RICH_FACTS' || profile === 'SELF_FACTS'
+    const selfSource = profile === 'SELF_FACTS'
     test(
-        `actual local encrypted ${rich ? 'RICH_V2' : 'TEXT_V1'} flow preserves LIVE and gates receipts on SEAL`,
+        `actual local encrypted ${profile} flow preserves LIVE and gates receipts on SEAL`,
         { timeout: 20_000 },
         async () => {
             const server = await FakeWaServer.start()
@@ -47,6 +58,9 @@ for (const rich of [false, true]) {
             const sealHeld = deferred()
             const sealEntered = deferred()
             const liveObserved = deferred()
+            const liveFactObserved = deferred()
+            const factEntered = deferred()
+            const factHeld = deferred()
             const historyReceipt = deferred()
             const histReceipt = deferred()
             const processed = deferred()
@@ -80,6 +94,7 @@ for (const rich of [false, true]) {
                     history: {
                         enabled: true,
                         groupBundles: false,
+                        ...(facts ? { streamFacts: 'EXACT_V1' as const } : {}),
                         ...(rich
                             ? {
                                   streamContent: 'RICH_V2' as const,
@@ -99,6 +114,9 @@ for (const rich of [false, true]) {
                             maxMessagesPerChunk: 2,
                             maxChunkBytes: 4_096,
                             maxParkedMessages: 2,
+                            ...(facts
+                                ? { facts: { maxFactsPerChunk: 1, maxFactChunkBytes: 4_096 } }
+                                : {}),
                             ...(rich
                                 ? {
                                       resources: {
@@ -122,14 +140,28 @@ for (const rich of [false, true]) {
                                 sealEntered.resolve()
                                 await sealHeld.promise
                             }
+                            if (event.type === 'FACT_CHUNK' && event.sequence === 1) {
+                                factEntered.resolve()
+                                await factHeld.promise
+                            }
                         }
                     }
                 },
                 createNoopLogger()
             )
+            // Local FakeWaServer pairing only: memory-only synthetic material,
+            // never rendered, printed, saved or taken from a real account.
+            const paired = deferred()
+            const material = selfSource
+                ? new Promise<ReturnType<typeof parsePairingQrString>>((resolve) => {
+                      client.once('auth_qr', (event) => resolve(parsePairingQrString(event.qr)))
+                      client.once('auth_paired', () => paired.resolve())
+                  })
+                : undefined
             client.on('message', (event) => {
                 liveMessageCount++
                 if (event.key.id === 'synthetic-live-envelope') liveObserved.resolve()
+                if (event.key.id === 'synthetic-live-facts') liveFactObserved.resolve()
             })
             client.on('debug_unhandled_stanza', () => {
                 unhandledCount++
@@ -140,10 +172,24 @@ for (const rich of [false, true]) {
             })
             try {
                 await client.connect()
-                const pipeline = await server.waitForAuthenticatedPipeline()
+                let pipeline = await server.waitForAuthenticatedPipeline()
+                if (selfSource) {
+                    const reconnected = server.waitForNextAuthenticatedPipeline()
+                    await server.runPairing(
+                        pipeline,
+                        { deviceJid: '5511999999999:1@s.whatsapp.net' },
+                        () => material!
+                    )
+                    await within(paired.promise, 'synthetic pairing')
+                    pipeline = await reconnected
+                }
                 await server.triggerPreKeyUpload(pipeline)
+                // All credentials in this test belong to the local synthetic server.
+                const syntheticSelf = selfSource
+                    ? client.getCredentials()!.meJid!.replace(/:\d+@/, '@')
+                    : undefined
                 const peer = await server.createFakePeer(
-                    { jid: '15551111111@s.whatsapp.net' },
+                    { jid: selfSource ? syntheticSelf! : '15551111111@s.whatsapp.net' },
                     pipeline
                 )
                 const contact = await server.createFakePeer(
@@ -189,23 +235,62 @@ for (const rich of [false, true]) {
                           }
                       ]
                     : Array.from({ length: 5 }, () => ({ conversation: 'synthetic history' }))
-                await peer.sendHistorySync(
-                    {
+                if (facts) {
+                    const bytes = proto.HistorySync.encode({
+                        syncType: 0,
                         progress: 100,
                         conversations: [
                             {
                                 id: '15552222222@s.whatsapp.net',
                                 messages: messages.map((message, index) => ({
-                                    id: `synthetic-history-${index}`,
-                                    fromMe: false,
-                                    timestamp: 1_700_000_000 + index,
-                                    message
+                                    message: {
+                                        key: {
+                                            id: `synthetic-history-${index}`,
+                                            fromMe: false,
+                                            remoteJid: '15552222222@s.whatsapp.net'
+                                        },
+                                        messageTimestamp: 1_700_000_000 + index,
+                                        message
+                                    }
                                 }))
                             }
+                        ],
+                        phoneNumberToLidMappings: [
+                            { pnJid: '15552222222@s.whatsapp.net', lidJid: '100000000000001@lid' },
+                            { pnJid: '15552222222@s.whatsapp.net', lidJid: '100000000000002@lid' }
                         ]
-                    },
-                    { id: 'synthetic-history-envelope' }
-                )
+                    }).finish()
+                    await peer.sendMessage(
+                        {
+                            protocolMessage: {
+                                type: proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+                                historySyncNotification: {
+                                    syncType: 0,
+                                    progress: 100,
+                                    initialHistBootstrapInlinePayload: gzipSync(bytes)
+                                }
+                            }
+                        },
+                        { id: 'synthetic-history-envelope' }
+                    )
+                } else
+                    await peer.sendHistorySync(
+                        {
+                            progress: 100,
+                            conversations: [
+                                {
+                                    id: '15552222222@s.whatsapp.net',
+                                    messages: messages.map((message, index) => ({
+                                        id: `synthetic-history-${index}`,
+                                        fromMe: false,
+                                        timestamp: 1_700_000_000 + index,
+                                        message
+                                    }))
+                                }
+                            ]
+                        },
+                        { id: 'synthetic-history-envelope' }
+                    )
                 await within(chunkEntered.promise, 'first chunk')
                 assert.deepEqual(
                     events.map((event) => event.type),
@@ -224,9 +309,23 @@ for (const rich of [false, true]) {
                 )
                 assert.equal(ordinaryReceipts, 0)
                 chunkHeld.resolve()
+                if (facts) {
+                    await within(factEntered.promise, 'held fact chunk')
+                    assert.equal(ordinaryReceipts, 0)
+                    assert.equal(histReceipts, 0)
+                    await contact.sendMessage(
+                        { conversation: 'synthetic live facts' },
+                        { id: 'synthetic-live-facts' }
+                    )
+                    await within(liveFactObserved.promise, 'live beside fact chunk')
+                    assert.equal(ordinaryReceipts, 0)
+                    factHeld.resolve()
+                }
                 await within(sealEntered.promise, 'seal')
                 assert.deepEqual(
-                    events.map((event) => event.type),
+                    events
+                        .filter((event) => event.type !== 'FACT_CHUNK')
+                        .map((event) => event.type),
                     ['BEGIN', 'CHUNK', 'CHUNK', 'CHUNK', 'SEAL']
                 )
                 assert.equal(ordinaryReceipts, 0)
@@ -244,6 +343,34 @@ for (const rich of [false, true]) {
                 assert.equal(seal.manifest.payloadIntegrityVerified, true)
                 assert.equal(seal.manifest.sourceHistoryCompleteness, 'UNKNOWN')
                 assert.equal(seal.contentProfile, rich ? 'RICH_V2' : undefined)
+                assert.equal(seal.factProfile, facts ? 'EXACT_V1' : undefined)
+                assert.equal(
+                    seal.sourceEnvelope?.origin,
+                    facts
+                        ? selfSource
+                            ? 'SELF_ACCOUNT_INCOMING_KEY'
+                            : 'OTHER_ACCOUNT_INCOMING_KEY'
+                        : undefined
+                )
+                if (facts)
+                    assert.equal(seal.sourceEnvelope?.sourceMessageId, 'synthetic-history-envelope')
+                if (facts) {
+                    const captured = events.flatMap((event) =>
+                        event.type === 'FACT_CHUNK' ? [...event.sourceFacts] : []
+                    )
+                    assert.equal(seal.factObservationCount, 3)
+                    assert.equal(
+                        captured.filter((fact) => fact.kind === 'IDENTITY_ASSERTION').length,
+                        2
+                    )
+                    assert.ok(
+                        captured.every(
+                            (fact) =>
+                                fact.kind !== 'IDENTITY_ASSERTION' ||
+                                fact.resolution === 'UNRESOLVED'
+                        )
+                    )
+                }
                 const rows = events.flatMap((event) =>
                     event.type === 'CHUNK' ? [...event.messageObservations] : []
                 )
@@ -262,6 +389,7 @@ for (const rich of [false, true]) {
             } finally {
                 chunkHeld.resolve()
                 sealHeld.resolve()
+                factHeld.resolve()
                 unsubscribe()
                 await client.disconnect()
                 await store.destroy()

@@ -3,7 +3,8 @@ import { performance } from 'node:perf_hooks'
 import type {
     WaHistorySyncBoundaryFaultReason,
     WaHistorySyncBoundaryLimits,
-    WaHistorySyncBoundaryState
+    WaHistorySyncBoundaryState,
+    WaHistorySyncSourceEnvelopeV2
 } from '@client/types'
 import type { WaDeferredHistoryReceipt } from '@message/primitives/incoming'
 import type { Proto } from '@proto'
@@ -13,6 +14,7 @@ interface QueuedHistoryWork {
     readonly receipt: WaDeferredHistoryReceipt
     readonly onSettled: () => void
     readonly retainedBytes: number
+    readonly sourceEnvelope?: WaHistorySyncSourceEnvelopeV2
 }
 
 interface ActiveHistoryWork extends QueuedHistoryWork {
@@ -35,7 +37,8 @@ export type ProcessHistorySyncWork = (
     notification: Proto.Message.IHistorySyncNotification,
     signal: AbortSignal,
     receipt: WaDeferredHistoryReceipt,
-    callbackLifecycle: HistorySyncCallbackLifecycle
+    callbackLifecycle: HistorySyncCallbackLifecycle,
+    sourceEnvelope?: WaHistorySyncSourceEnvelopeV2
 ) => Promise<void>
 
 /** Per-client bounded executor for the optional durable-history boundary. */
@@ -72,7 +75,8 @@ export class HistorySyncBoundaryWorker {
         notification: Proto.Message.IHistorySyncNotification,
         receipt: WaDeferredHistoryReceipt,
         onSettled: () => void,
-        hasUnsupportedEnvelopeUnknowns = false
+        hasUnsupportedEnvelopeUnknowns = false,
+        sourceEnvelope?: WaHistorySyncSourceEnvelopeV2
     ): boolean {
         if (this.status === 'FAULTED') {
             receipt.fail()
@@ -88,7 +92,7 @@ export class HistorySyncBoundaryWorker {
             return false
         }
 
-        const retainedBytes = estimateRetainedBytes(notification)
+        const retainedBytes = estimateRetainedBytes(notification, sourceEnvelope)
         const sourceBytes = readDeclaredLength(notification)
         if (
             retainedBytes === null ||
@@ -114,7 +118,8 @@ export class HistorySyncBoundaryWorker {
             notification,
             receipt,
             onSettled,
-            retainedBytes
+            retainedBytes,
+            sourceEnvelope
         }
 
         if (this.active.size < this.limits.maxConcurrentBatches) {
@@ -206,7 +211,8 @@ export class HistorySyncBoundaryWorker {
                 work.notification,
                 work.controller.signal,
                 work.receipt,
-                callbackLifecycle
+                callbackLifecycle,
+                work.sourceEnvelope
             )
         } catch {
             work.receipt.fail()
@@ -350,7 +356,8 @@ export class HistorySyncBoundaryWorker {
 }
 
 function estimateRetainedBytes(
-    notification: Proto.Message.IHistorySyncNotification
+    notification: Proto.Message.IHistorySyncNotification,
+    sourceEnvelope?: WaHistorySyncSourceEnvelopeV2
 ): number | null {
     let size = 256
     const countedBuffers = new Set<ArrayBufferLike>()
@@ -372,6 +379,8 @@ function estimateRetainedBytes(
     add(notification.originalMessageId)
     add(notification.peerDataRequestSessionId)
     add(notification.encHandle)
+    add(sourceEnvelope?.sourceMessageId)
+    if (sourceEnvelope) size += 128
     add(notification.mediaKey)
     add(notification.fileSha256)
     add(notification.fileEncSha256)

@@ -378,6 +378,8 @@ export interface WaHistorySyncOptions {
     readonly streamLimits?: WaHistorySyncStreamLimits
     /** v2-only rich projection is explicit; omission preserves the initial TEXT_V1 projection. */
     readonly streamContent?: 'TEXT_V1' | 'RICH_V2'
+    /** Opt-in bounded source facts. Assertions are provisional, not resolved identity/merge authority. */
+    readonly streamFacts?: 'EXACT_V1'
     /** v2-only optional source mailbox policy. Protocol-private state is never disabled by this. */
     readonly privateMailbox?: 'PRESERVE' | 'DISABLED'
     /** Required with either boundary; caller-selected finite values, no library defaults. */
@@ -395,7 +397,56 @@ export interface WaHistorySyncStreamLimits {
     readonly maxParkedMessages: number
     /** Independent working-set limits; required with RICH_V2, opt-in with TEXT_V1. No defaults. */
     readonly resources?: WaHistorySyncResourceLimits
+    /** Required with streamFacts; independent finite fact count/JSON-array byte budgets. */
+    readonly facts?: { readonly maxFactsPerChunk: number; readonly maxFactChunkBytes: number }
 }
+
+/** Source facts must be staged with the complete capture, never used before verified SEAL. */
+export interface WaHistorySyncSourceEnvelopeV2 {
+    /** Existing authenticated incoming-key classification, not a new primary-device or mapping assertion. */
+    readonly origin:
+        | 'SELF_ACCOUNT_INCOMING_KEY'
+        | 'OTHER_ACCOUNT_INCOMING_KEY'
+        | 'UNVERIFIED_SOURCE'
+    readonly sourceMessageId?: string
+    readonly senderDevice?: number
+}
+
+/** Source facts must be staged with the complete capture, never used before verified SEAL. */
+export type WaHistorySyncSourceFactV2 =
+    | {
+          readonly ordinal: number
+          readonly kind: 'CONVERSATION'
+          readonly source: 'HISTORY_SYNC_CONVERSATION'
+          readonly conversationOrdinal: number
+          readonly chatKind: WaHistorySyncChatKind
+          readonly conversationAddress?: string
+          readonly name?: string
+          /** Exact source values; units/semantics remain source-qualified, not completeness/unread authority. */
+          readonly lastMsgTimestamp?: string
+          readonly conversationTimestamp?: string
+      }
+    | {
+          readonly ordinal: number
+          readonly kind: 'IDENTITY_ASSERTION'
+          readonly source: 'HISTORY_SYNC_ROOT_15'
+          readonly evidenceVersion: 1
+          readonly sourceOccurrence: number
+          readonly evidenceId: string
+          readonly phoneIdentity: string
+          readonly lidIdentity: string
+          readonly relation: 'EXPLICIT_PHONE_LID_PAIR'
+          /** Every conflicting assertion must be retained and checked durably before resolving an alias. */
+          readonly resolution: 'UNRESOLVED'
+      }
+    | {
+          readonly ordinal: number
+          readonly kind: 'IDENTITY_UNRESOLVED'
+          readonly source: 'HISTORY_SYNC_ROOT_15'
+          readonly evidenceVersion: 1
+          readonly sourceOccurrence: number
+          readonly reason: 'MISSING_PAIR' | 'INVALID_PAIR' | 'DUPLICATE_COMPONENT'
+      }
 
 export interface WaHistorySyncResourceLimits {
     readonly maxRecordBytes: number
@@ -573,6 +624,8 @@ export type WaHistorySyncStreamEventV2 =
           readonly sourceHistoryCompleteness: 'UNKNOWN'
           readonly notification: WaHistorySyncBatchV1['notification']
           readonly contentProfile?: 'RICH_V2'
+          readonly factProfile?: 'EXACT_V1'
+          readonly sourceEnvelope?: WaHistorySyncSourceEnvelopeV2
       }
     | {
           readonly version: 2
@@ -583,12 +636,23 @@ export type WaHistorySyncStreamEventV2 =
       }
     | {
           readonly version: 2
+          readonly type: 'FACT_CHUNK'
+          readonly captureId: string
+          readonly sequence: number
+          readonly sourceFacts: readonly WaHistorySyncSourceFactV2[]
+      }
+    | {
+          readonly version: 2
           readonly type: 'SEAL'
           readonly captureId: string
           readonly chunkCount: number
           readonly messageObservationCount: number
           readonly manifest: Omit<WaHistorySyncBatchV1, 'version' | 'messageObservations'>
           readonly contentProfile?: 'RICH_V2'
+          readonly factProfile?: 'EXACT_V1'
+          readonly factChunkCount?: number
+          readonly factObservationCount?: number
+          readonly sourceEnvelope?: WaHistorySyncSourceEnvelopeV2
       }
     | {
           readonly version: 2

@@ -17,6 +17,8 @@ export type {
     WaHistorySyncContentV2,
     WaHistorySyncMediaMetadataV2,
     WaHistorySyncMessageObservationV2,
+    WaHistorySyncSourceFactV2,
+    WaHistorySyncSourceEnvelopeV2,
     WaHistorySyncFamilyDisposition,
     WaLogoutStoreClearOptions
 } from '@client/types'

@@ -1,14 +1,18 @@
 # History boundary v2: incremental capture candidate
 
+The later opt-in [source-fact contract](./HISTORY_FACTS_V2.md) adds exact root15
+assertions, conversation facts and measured bounded-source evidence. Old profiles
+retain the event/count contract recorded here.
+
 ## Authority and status
 
 The GaxCor/zapo fork expansion was explicitly authorized on 2026-10-12 for the
 CRM History Sync v1 milestone. This implementation checkpoint starts from the
 previously accepted source `7b805e8d95fbdc27c89a1933e7173fe4099344b8`, not the fork's
 unrelated master@1.9.0 line. It is an additive candidate, not an accepted/published
-replacement package or real WhatsApp history acceptance. The root package version
-still identifies the inherited source line; assign a distinct new version before
-creating a candidate artifact. Do not relabel/repack it as the old CRM artifact.
+replacement package or real WhatsApp history acceptance. The first checkpoints
+retained the inherited version; the source-facts candidate now has distinct version
+1.9.1 for reproducible packaging. Do not relabel/repack it as the old CRM artifact.
 
 No wire format, protobuf schema, stanza, query, cryptography or receipt builder is
 changed. This slice reuses the accepted decoder and its exact dispositions. The
@@ -221,8 +225,8 @@ changes are included in the checkpoint. Initial fake-flow test predicates were c
 to the actual incoming `event.key.id` API and to distinguish ordinary and `hist_sync`
 receipts; no product regression was hidden or source receipt assertion removed.
 
-Before adoption: complete richer projection/resource work, distinct version and
-immutable source artifact/provenance checks, compatibility/build/license/security
+The source-facts follow-up records the completed rich/resource source gates.
+Before adoption: immutable source artifact/provenance checks, compatibility/build/license/security
 review, durable PostgreSQL consumer and schema gates, recovery/LIVE/resource gates,
 dedicated real acceptance, exact-candidate CI and normal PR review/integration.
 Do not enable history in the real unit merely because this checkpoint is green.

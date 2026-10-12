@@ -280,6 +280,22 @@ function validateHistoryBoundaryOptions(options: WaClientOptions): void {
         throw new Error('history.onBatch and history.onStream are mutually exclusive')
     }
     if (history?.onStream) {
+        if (history.streamFacts !== undefined && history.streamFacts !== 'EXACT_V1')
+            throw new Error('history.streamFacts is unsupported')
+        if (history.streamFacts) {
+            if (!history.streamLimits?.resources || !history.streamLimits.facts)
+                throw new Error('history facts require explicit resource and fact limits')
+            for (const value of [
+                history.streamLimits.facts.maxFactsPerChunk,
+                history.streamLimits.facts.maxFactChunkBytes
+            ]) {
+                if (!Number.isSafeInteger(value) || value <= 0)
+                    throw new Error('history fact limits must be positive safe integers')
+            }
+            if (history.streamLimits.facts.maxFactChunkBytes < 2)
+                throw new Error('history fact bytes must allow array framing')
+        } else if (history.streamLimits?.facts)
+            throw new Error('history fact limits require streamFacts')
         if (
             history.streamContent !== undefined &&
             !['TEXT_V1', 'RICH_V2'].includes(history.streamContent)
@@ -328,7 +344,9 @@ function validateHistoryBoundaryOptions(options: WaClientOptions): void {
     }
     if (
         !history?.onStream &&
-        (history?.streamContent !== undefined || history?.privateMailbox !== undefined)
+        (history?.streamContent !== undefined ||
+            history?.privateMailbox !== undefined ||
+            history?.streamFacts !== undefined)
     ) {
         throw new Error('history stream projection/mailbox options require history.onStream')
     }

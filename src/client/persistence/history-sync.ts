@@ -1,5 +1,6 @@
 import { flushPendingWrites, openHistoryBlobStream } from '@client/persistence/history-blob'
 import { projectHistoryContentV2 } from '@client/persistence/history-content-v2'
+import { projectHistoryIdentityAssertion } from '@client/persistence/history-facts-v2'
 import {
     historyFailure,
     type HistoryFailureReason,
@@ -22,6 +23,7 @@ import type {
     WaHistorySyncFamilyDisposition,
     WaHistorySyncMessageObservation,
     WaHistorySyncMessageObservationV2,
+    WaHistorySyncSourceEnvelopeV2,
     WaHistorySyncStreamHandler,
     WaHistorySyncStreamLimits
 } from '@client/types'
@@ -131,6 +133,8 @@ interface HistoryBoundaryMessageContext {
     readonly onStream?: WaHistorySyncStreamHandler
     readonly streamLimits?: WaHistorySyncStreamLimits
     readonly streamContent?: 'TEXT_V1' | 'RICH_V2'
+    readonly streamFacts?: 'EXACT_V1'
+    readonly sourceEnvelope?: WaHistorySyncSourceEnvelopeV2
     readonly privateMailbox?: 'PRESERVE' | 'DISABLED'
 }
 
@@ -149,6 +153,7 @@ interface HistoryBoundaryCapture {
     decodedSyncType: number | null
     sourceRecordCount: number
     retainedPrivateBytes: number
+    identityOccurrences: number
 }
 
 interface HistorySyncChunkState {
@@ -266,7 +271,9 @@ export async function processHistorySyncNotification(
                                     boundaryContext.onStream,
                                     boundaryContext.streamLimits,
                                     boundaryContext.signal,
-                                    boundaryContext.streamContent
+                                    boundaryContext.streamContent,
+                                    boundaryContext.streamFacts,
+                                    boundaryContext.sourceEnvelope
                                 )
                             }
                           : {}),
@@ -276,7 +283,8 @@ export async function processHistorySyncNotification(
                       blockedReason: null,
                       decodedSyncType: null,
                       sourceRecordCount: 0,
-                      retainedPrivateBytes: 0
+                      retainedPrivateBytes: 0,
+                      identityOccurrences: 0
                   }
               }
             : {}),
@@ -588,6 +596,8 @@ async function consumeHistorySyncStream(
                     event.fieldNumber === CONVERSATION_FIELDS.ID &&
                     event.wireType === PROTO_WIRE_TYPES.LEN
                 ) {
+                    if (state.boundary?.context.streamFacts && threadJid !== null)
+                        throw new Error('repeated history conversation identity is ambiguous')
                     threadJid = TEXT_DECODER.decode(event.value)
                 }
                 headerParts[headerParts.length] = new Uint8Array(event.raw)
@@ -662,6 +672,16 @@ async function consumeHistorySyncStream(
             chargePrivateRetention(state, event.raw.buffer.byteLength * 2 + 256)
             state.pushnames[state.pushnames.length] = proto.Pushname.decode(event.value)
         } else if (event.fieldNumber === HISTORY_SYNC_FIELDS.PHONE_NUMBER_TO_LID_MAPPINGS) {
+            if (state.boundary?.context.streamFacts) {
+                state.boundary.identityOccurrences++
+                await state.boundary.stream!.appendFact(
+                    projectHistoryIdentityAssertion(
+                        event.value,
+                        state.boundary.identityOccurrences,
+                        validation!.chargeField
+                    )
+                )
+            }
             if (state.boundary?.context.privateMailbox === 'DISABLED') return
             chargePrivateRetention(state, event.raw.buffer.byteLength * 2 + 256)
             const map = proto.PhoneNumberToLIDMapping.decode(event.value)
@@ -744,6 +764,35 @@ async function closeConversation(
                 const message = readHistoryMessage(record)
                 if (message) persistHistoryMessage(deps, state, message, resolvedJid)
             }
+        }
+        if (state.boundary.context.streamFacts) {
+            const chatKind = classifyHistoryChat(resolvedJid)
+            await state.boundary.stream!.appendFact({
+                kind: 'CONVERSATION',
+                source: 'HISTORY_SYNC_CONVERSATION',
+                conversationOrdinal,
+                chatKind,
+                ...(chatKind === 'DIRECT'
+                    ? {
+                          conversationAddress: resolvedJid,
+                          ...(conversation.name !== null && conversation.name !== undefined
+                              ? { name: conversation.name }
+                              : {}),
+                          ...(conversation.lastMsgTimestamp !== null &&
+                          conversation.lastMsgTimestamp !== undefined
+                              ? { lastMsgTimestamp: longToString(conversation.lastMsgTimestamp) }
+                              : {}),
+                          ...(conversation.conversationTimestamp !== null &&
+                          conversation.conversationTimestamp !== undefined
+                              ? {
+                                    conversationTimestamp: longToString(
+                                        conversation.conversationTimestamp
+                                    )
+                                }
+                              : {})
+                      }
+                    : {})
+            })
         }
     }
 
