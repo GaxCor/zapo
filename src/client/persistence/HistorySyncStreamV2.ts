@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 
 import type {
     WaHistorySyncBatchV1,
-    WaHistorySyncMessageObservation,
+    WaHistorySyncMessageObservationV2,
     WaHistorySyncStreamEventV2,
     WaHistorySyncStreamHandler,
     WaHistorySyncStreamLimits
@@ -12,7 +12,7 @@ import { TEXT_ENCODER } from '@util/bytes'
 /** One sequential provisional capture; no full-batch observation collection. */
 export class HistorySyncStreamV2 {
     private readonly captureId = randomUUID()
-    private pending: WaHistorySyncMessageObservation[] = []
+    private pending: WaHistorySyncMessageObservationV2[] = []
     private pendingBytes = 2
     private chunkCount = 0
     private messageCount = 0
@@ -22,7 +22,8 @@ export class HistorySyncStreamV2 {
     public constructor(
         private readonly handler: WaHistorySyncStreamHandler,
         private readonly limits: WaHistorySyncStreamLimits,
-        private readonly signal: AbortSignal
+        private readonly signal: AbortSignal,
+        private readonly contentProfile: 'TEXT_V1' | 'RICH_V2' = 'TEXT_V1'
     ) {}
 
     public async begin(notification: WaHistorySyncBatchV1['notification']): Promise<void> {
@@ -33,16 +34,22 @@ export class HistorySyncStreamV2 {
             type: 'BEGIN',
             captureId: this.captureId,
             sourceHistoryCompleteness: 'UNKNOWN',
-            notification
+            notification,
+            ...(this.contentProfile === 'RICH_V2' ? { contentProfile: 'RICH_V2' as const } : {})
         })
     }
 
-    public async append(observation: WaHistorySyncMessageObservation): Promise<void> {
+    public async append(observation: WaHistorySyncMessageObservationV2): Promise<void> {
         this.assertBuilding()
         if (observation.ordinal !== this.messageCount + 1) {
             throw new Error('history stream observation ordinal is not contiguous')
         }
-        const bytes = TEXT_ENCODER.encode(JSON.stringify(observation)).byteLength
+        // Protected handles reject generic JSON. Charge them separately without
+        // copying keys/locators into a temporary serialized object or diagnostics.
+        const { mediaSource, ...metadata } = observation
+        const bytes =
+            TEXT_ENCODER.encode(JSON.stringify(metadata)).byteLength +
+            (mediaSource?.getRetainedByteLength() ?? 0)
         if (bytes + 2 > this.limits.maxChunkBytes) {
             throw new Error('history stream observation exceeds configured chunk byte limit')
         }
@@ -67,7 +74,8 @@ export class HistorySyncStreamV2 {
             captureId: this.captureId,
             chunkCount: this.chunkCount,
             messageObservationCount: this.messageCount,
-            manifest
+            manifest,
+            ...(this.contentProfile === 'RICH_V2' ? { contentProfile: 'RICH_V2' as const } : {})
         })
         this.terminal = true
     }

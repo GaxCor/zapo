@@ -1,4 +1,5 @@
 export { WaClient } from '@client'
+export { WaHistorySyncMediaSourceV2 } from '@client/persistence/WaHistorySyncMediaSourceV2'
 export { defineWaClientPlugin } from '@client/plugins'
 export type { WaClientDependencies } from '@client/WaClientFactory'
 export type {
@@ -13,6 +14,10 @@ export type {
     WaHistorySyncStreamEventV2,
     WaHistorySyncStreamHandler,
     WaHistorySyncStreamLimits,
+    WaHistorySyncResourceLimits,
+    WaHistorySyncContentV2,
+    WaHistorySyncMediaMetadataV2,
+    WaHistorySyncMessageObservationV2,
     WaHistorySyncChunkEvent,
     WaHistorySyncBoundaryLimits,
     WaHistorySyncBoundaryFailureEvent,

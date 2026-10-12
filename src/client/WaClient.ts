@@ -175,7 +175,8 @@ class WaClientImpl extends EventEmitter {
                 (reason) => {
                     this.emit('history_sync_boundary_fault', { state: 'FAULTED', reason })
                     this.logger.warn('history boundary entered terminal faulted state', { reason })
-                }
+                },
+                historyOptions.streamLimits?.resources?.maxRetainedNotificationBytes
             )
         }
 
@@ -562,7 +563,12 @@ class WaClientImpl extends EventEmitter {
                 limits: history.boundaryLimits,
                 signal,
                 ...(history.onStream
-                    ? { onStream: invoke, streamLimits: history.streamLimits }
+                    ? {
+                          onStream: invoke,
+                          streamLimits: history.streamLimits,
+                          streamContent: history.streamContent,
+                          privateMailbox: history.privateMailbox
+                      }
                     : { onBatch: invoke })
             }
         )

@@ -1,4 +1,5 @@
 export { WaClient } from '@client/WaClient'
+export { WaHistorySyncMediaSourceV2 } from '@client/persistence/WaHistorySyncMediaSourceV2'
 export type {
     WaAppStateMessageKey,
     WaAppStateMutationEvent,
@@ -12,6 +13,10 @@ export type {
     WaHistorySyncStreamEventV2,
     WaHistorySyncStreamHandler,
     WaHistorySyncStreamLimits,
+    WaHistorySyncResourceLimits,
+    WaHistorySyncContentV2,
+    WaHistorySyncMediaMetadataV2,
+    WaHistorySyncMessageObservationV2,
     WaHistorySyncFamilyDisposition,
     WaLogoutStoreClearOptions
 } from '@client/types'

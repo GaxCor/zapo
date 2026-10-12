@@ -280,6 +280,18 @@ function validateHistoryBoundaryOptions(options: WaClientOptions): void {
         throw new Error('history.onBatch and history.onStream are mutually exclusive')
     }
     if (history?.onStream) {
+        if (
+            history.streamContent !== undefined &&
+            !['TEXT_V1', 'RICH_V2'].includes(history.streamContent)
+        ) {
+            throw new Error('history.streamContent is unsupported')
+        }
+        if (
+            history.privateMailbox !== undefined &&
+            !['PRESERVE', 'DISABLED'].includes(history.privateMailbox)
+        ) {
+            throw new Error('history.privateMailbox is unsupported')
+        }
         if (!history.streamLimits)
             throw new Error('history.streamLimits are required with onStream')
         for (const name of ['maxMessagesPerChunk', 'maxChunkBytes', 'maxParkedMessages'] as const) {
@@ -291,8 +303,34 @@ function validateHistoryBoundaryOptions(options: WaClientOptions): void {
         if (history.streamLimits.maxChunkBytes < 2) {
             throw new Error('history.streamLimits.maxChunkBytes must allow array framing')
         }
+        const resources = history.streamLimits.resources
+        if (history.streamContent === 'RICH_V2' && !resources) {
+            throw new Error('rich history requires explicit stream resource limits')
+        }
+        if (resources) {
+            for (const name of [
+                'maxRecordBytes',
+                'maxConversationHeaderBytes',
+                'maxParkedBytes',
+                'maxRetainedPrivateBytes',
+                'maxRetainedNotificationBytes',
+                'maxThumbnailBytes'
+            ] as const) {
+                if (!Number.isSafeInteger(resources[name]) || resources[name] <= 0) {
+                    throw new Error(
+                        `history.streamLimits.resources.${name} must be a positive safe integer`
+                    )
+                }
+            }
+        }
     } else if (history?.streamLimits) {
         throw new Error('history.streamLimits require history.onStream')
+    }
+    if (
+        !history?.onStream &&
+        (history?.streamContent !== undefined || history?.privateMailbox !== undefined)
+    ) {
+        throw new Error('history stream projection/mailbox options require history.onStream')
     }
     if (history?.onBatch || history?.onStream) {
         if (history.enabled === false) {

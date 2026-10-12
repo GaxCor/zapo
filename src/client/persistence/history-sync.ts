@@ -1,4 +1,5 @@
 import { flushPendingWrites, openHistoryBlobStream } from '@client/persistence/history-blob'
+import { projectHistoryContentV2 } from '@client/persistence/history-content-v2'
 import {
     historyFailure,
     type HistoryFailureReason,
@@ -20,6 +21,7 @@ import type {
     WaHistorySyncChunkEvent,
     WaHistorySyncFamilyDisposition,
     WaHistorySyncMessageObservation,
+    WaHistorySyncMessageObservationV2,
     WaHistorySyncStreamHandler,
     WaHistorySyncStreamLimits
 } from '@client/types'
@@ -128,6 +130,8 @@ interface HistoryBoundaryMessageContext {
     readonly onBatch?: WaHistorySyncBatchHandler
     readonly onStream?: WaHistorySyncStreamHandler
     readonly streamLimits?: WaHistorySyncStreamLimits
+    readonly streamContent?: 'TEXT_V1' | 'RICH_V2'
+    readonly privateMailbox?: 'PRESERVE' | 'DISABLED'
 }
 
 interface HistoryBoundaryCapture {
@@ -144,6 +148,7 @@ interface HistoryBoundaryCapture {
     blockedReason: Error | null
     decodedSyncType: number | null
     sourceRecordCount: number
+    retainedPrivateBytes: number
 }
 
 interface HistorySyncChunkState {
@@ -157,6 +162,7 @@ interface HistorySyncChunkState {
     readonly tokenConversations: WaHistorySyncPrivacyTokenConversation[]
     readonly boundary?: HistoryBoundaryCapture
     readonly boundaryParkedRecords: Uint8Array[]
+    boundaryParkedBytes: number
     nctSalt: Uint8Array | null
     chunkOrder: number | null
     progress: number | null
@@ -259,7 +265,8 @@ export async function processHistorySyncNotification(
                                 stream: new HistorySyncStreamV2(
                                     boundaryContext.onStream,
                                     boundaryContext.streamLimits,
-                                    boundaryContext.signal
+                                    boundaryContext.signal,
+                                    boundaryContext.streamContent
                                 )
                             }
                           : {}),
@@ -268,11 +275,13 @@ export async function processHistorySyncNotification(
                       deferredMessageWrites: [],
                       blockedReason: null,
                       decodedSyncType: null,
-                      sourceRecordCount: 0
+                      sourceRecordCount: 0,
+                      retainedPrivateBytes: 0
                   }
               }
             : {}),
         boundaryParkedRecords: [],
+        boundaryParkedBytes: 0,
         nctSalt: null,
         chunkOrder: null,
         progress: null,
@@ -418,12 +427,14 @@ async function consumeHistorySyncStream(
     let headerParts: Uint8Array[] | null = null
     let threadJid: string | null = null
     let parked: ParkedHistoryMessage[] | null = null
+    let headerBytes = 0
     const validation: HistoryProtocolValidationContext | undefined = state.boundary
         ? {
               signal: state.boundary.context.signal,
               maxFieldBytes: Math.min(
                   HISTORY_SYNC_MAX_RECORD_BYTES,
-                  state.boundary.context.limits.maxBatchBytes
+                  state.boundary.context.limits.maxBatchBytes,
+                  state.boundary.context.streamLimits?.resources?.maxRecordBytes ?? Infinity
               ),
               chargeField: () => {
                   const boundary = state.boundary!
@@ -446,10 +457,12 @@ async function consumeHistorySyncStream(
         }
         if (event.kind === PROTO_STREAM_EVENT_KINDS.ENTER) {
             headerParts = []
+            headerBytes = 0
             threadJid = null
             parked = null
             state.conversationsCount += 1
             state.boundaryParkedRecords.length = 0
+            state.boundaryParkedBytes = 0
             return undefined
         }
 
@@ -458,6 +471,7 @@ async function consumeHistorySyncStream(
             const jid = threadJid
             const pending = parked
             const boundaryRecords = state.boundaryParkedRecords.splice(0)
+            state.boundaryParkedBytes = 0
             const conversationOrdinal = state.conversationsCount
             headerParts = null
             threadJid = null
@@ -517,7 +531,16 @@ async function consumeHistorySyncStream(
                                 'history stream exceeds configured parked-message limit'
                             )
                         }
-                        state.boundaryParkedRecords.push(recordBytes.slice())
+                        const parkedLimit =
+                            state.boundary.context.streamLimits?.resources?.maxParkedBytes
+                        if (
+                            parkedLimit !== undefined &&
+                            state.boundaryParkedBytes + recordBytes.byteLength + 128 > parkedLimit
+                        ) {
+                            throw new Error('history stream exceeds configured parked-byte limit')
+                        }
+                        state.boundaryParkedBytes += recordBytes.byteLength + 128
+                        state.boundaryParkedRecords.push(new Uint8Array(recordBytes))
                     } else {
                         await captureBoundaryMessage(
                             state,
@@ -527,6 +550,12 @@ async function consumeHistorySyncStream(
                         )
                     }
                 }
+                if (
+                    state.boundary &&
+                    (state.boundary.context.privateMailbox === 'DISABLED' ||
+                        state.boundaryParkedRecords.length > 0)
+                )
+                    return maybeFlush(state)
                 const message = readHistoryMessage(recordBytes)
                 if (!message) {
                     return undefined
@@ -546,13 +575,22 @@ async function consumeHistorySyncStream(
             }
 
             if (headerParts) {
+                const headerLimit =
+                    state.boundary?.context.streamLimits?.resources?.maxConversationHeaderBytes
+                if (
+                    headerLimit !== undefined &&
+                    headerBytes + event.raw.byteLength + 64 > headerLimit
+                ) {
+                    throw new Error('history stream exceeds configured conversation-header limit')
+                }
+                headerBytes += event.raw.byteLength + 64
                 if (
                     event.fieldNumber === CONVERSATION_FIELDS.ID &&
                     event.wireType === PROTO_WIRE_TYPES.LEN
                 ) {
                     threadJid = TEXT_DECODER.decode(event.value)
                 }
-                headerParts[headerParts.length] = event.raw.slice()
+                headerParts[headerParts.length] = new Uint8Array(event.raw)
             }
             return undefined
         }
@@ -620,20 +658,27 @@ async function consumeHistorySyncStream(
         }
 
         if (event.fieldNumber === HISTORY_SYNC_FIELDS.PUSHNAMES) {
+            if (state.boundary?.context.privateMailbox === 'DISABLED') return
+            chargePrivateRetention(state, event.raw.buffer.byteLength * 2 + 256)
             state.pushnames[state.pushnames.length] = proto.Pushname.decode(event.value)
         } else if (event.fieldNumber === HISTORY_SYNC_FIELDS.PHONE_NUMBER_TO_LID_MAPPINGS) {
+            if (state.boundary?.context.privateMailbox === 'DISABLED') return
+            chargePrivateRetention(state, event.raw.buffer.byteLength * 2 + 256)
             const map = proto.PhoneNumberToLIDMapping.decode(event.value)
             if (map.pnJid && map.lidJid) {
                 state.pnToLid.set(map.pnJid, map.lidJid)
             }
         } else if (event.fieldNumber === HISTORY_SYNC_FIELDS.INLINE_CONTACTS) {
+            if (state.boundary?.context.privateMailbox === 'DISABLED') return
+            chargePrivateRetention(state, event.raw.buffer.byteLength * 2 + 256)
             const contact = proto.InlineContact.decode(event.value)
             state.inlineContacts[state.inlineContacts.length] = contact
             if (contact.pnJid && contact.lidJid) {
                 state.pnToLid.set(contact.pnJid, contact.lidJid)
             }
         } else if (event.fieldNumber === HISTORY_SYNC_FIELDS.NCT_SALT) {
-            state.nctSalt = event.value.slice()
+            chargePrivateRetention(state, event.value.byteLength + 128)
+            state.nctSalt = new Uint8Array(event.value)
         }
         return undefined
     }
@@ -643,7 +688,11 @@ async function consumeHistorySyncStream(
         shouldDescend: (fieldNumber, depth) =>
             depth === 0 && fieldNumber === HISTORY_SYNC_FIELDS.CONVERSATIONS,
         maxFieldBytes: state.boundary
-            ? Math.min(HISTORY_SYNC_MAX_RECORD_BYTES, state.boundary.context.limits.maxBatchBytes)
+            ? Math.min(
+                  HISTORY_SYNC_MAX_RECORD_BYTES,
+                  state.boundary.context.limits.maxBatchBytes,
+                  state.boundary.context.streamLimits?.resources?.maxRecordBytes ?? Infinity
+              )
             : HISTORY_SYNC_MAX_RECORD_BYTES,
         maxTotalBytes: state.boundary?.context.limits.maxBatchBytes
     })
@@ -672,6 +721,7 @@ async function closeConversation(
         deps.logger.debug('skipping history sync conversation without thread jid')
         return
     }
+    const preserveMailbox = state.boundary?.context.privateMailbox !== 'DISABLED'
     if (state.boundary) {
         if (conversation.$unknowns?.length) {
             state.boundary.blockedReason ??= unknownFieldFailure(
@@ -690,12 +740,17 @@ async function closeConversation(
         }
         for (const record of boundaryRecords) {
             await captureBoundaryMessage(state, record, resolvedJid, conversationOrdinal)
+            if (preserveMailbox) {
+                const message = readHistoryMessage(record)
+                if (message) persistHistoryMessage(deps, state, message, resolvedJid)
+            }
         }
     }
 
-    if (conversation.pnJid) {
+    if (preserveMailbox && conversation.pnJid) {
         const lidJid = conversation.lidJid ?? conversation.accountLid
         if (lidJid) {
+            chargePrivateRetention(state, (conversation.pnJid.length + lidJid.length) * 2 + 256)
             state.pnToLid.set(conversation.pnJid, lidJid)
         }
     }
@@ -706,6 +761,10 @@ async function closeConversation(
             conversation.tcTokenTimestamp ||
             conversation.tcTokenSenderTimestamp)
     ) {
+        chargePrivateRetention(
+            state,
+            resolvedJid.length * 2 + (conversation.tcToken?.byteLength ?? 0) + 256
+        )
         state.tokenConversations[state.tokenConversations.length] = {
             jid: resolvedJid,
             tcToken: conversation.tcToken ? new Uint8Array(conversation.tcToken) : undefined,
@@ -742,21 +801,25 @@ async function closeConversation(
                 })
         )
     }
-    pushWrite(state, () =>
-        deps.writeBehind.persistThreadAsync({
-            jid: resolvedJid,
-            name: conversation.name ?? undefined,
-            unreadCount: conversation.unreadCount ?? undefined,
-            archived: conversation.archived ?? undefined,
-            pinned: conversation.pinned ?? undefined,
-            muteEndMs: longToNumber(conversation.muteEndTime) || undefined,
-            markedAsUnread: conversation.markedAsUnread ?? undefined,
-            ephemeralExpiration,
-            ephemeralSettingTimestamp
-        })
-    )
+    if (preserveMailbox)
+        pushWrite(state, () =>
+            deps.writeBehind.persistThreadAsync({
+                jid: resolvedJid,
+                name: conversation.name ?? undefined,
+                unreadCount: conversation.unreadCount ?? undefined,
+                archived: conversation.archived ?? undefined,
+                pinned: conversation.pinned ?? undefined,
+                muteEndMs: longToNumber(conversation.muteEndTime) || undefined,
+                markedAsUnread: conversation.markedAsUnread ?? undefined,
+                ephemeralExpiration,
+                ephemeralSettingTimestamp
+            })
+        )
 
-    if (isUserJid(resolvedJid) || (conversation.lidJid ?? conversation.accountLid)) {
+    if (
+        preserveMailbox &&
+        (isUserJid(resolvedJid) || (conversation.lidJid ?? conversation.accountLid))
+    ) {
         const contactDisplay = conversation.displayName || undefined
         const contactUsername = conversation.username
             ? normalizeUsername(conversation.username)
@@ -814,6 +877,12 @@ function persistHistoryMessage(
             messageBytes: message.messageBytes
         })
     if (state.boundary) {
+        chargePrivateRetention(
+            state,
+            message.messageBytes.buffer.byteLength +
+                (message.id.length + threadJid.length + (authorJid?.length ?? 0)) * 2 +
+                512
+        )
         state.boundary.deferredMessageWrites.push(persist)
     } else {
         pushWrite(state, persist)
@@ -1055,10 +1124,32 @@ async function captureBoundaryMessage(
     }
     boundary.observationCount += 1
     if (boundary.stream) {
-        await boundary.stream.append(observation)
+        const projected: WaHistorySyncMessageObservationV2 =
+            isDirect && message.message && boundary.context.streamContent === 'RICH_V2'
+                ? {
+                      ...observation,
+                      ...projectHistoryContentV2(
+                          message.message,
+                          boundary.context.streamLimits!.resources!.maxThumbnailBytes
+                      )
+                  }
+                : observation
+        await boundary.stream.append(projected)
+        if (boundary.context.privateMailbox === 'DISABLED' && message.key?.id && message.message)
+            state.messagesCount += 1
     } else {
         boundary.observations.push(observation)
     }
+}
+
+function chargePrivateRetention(state: HistorySyncChunkState, bytes: number): void {
+    const boundary = state.boundary
+    const limit = boundary?.context.streamLimits?.resources?.maxRetainedPrivateBytes
+    if (!boundary || limit === undefined) return
+    if (!Number.isSafeInteger(bytes) || boundary.retainedPrivateBytes + bytes > limit) {
+        throw new Error('history stream exceeds configured private-retention limit')
+    }
+    boundary.retainedPrivateBytes += bytes
 }
 
 function projectNotification(

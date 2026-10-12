@@ -14,7 +14,8 @@ No wire format, protobuf schema, stanza, query, cryptography or receipt builder 
 changed. This slice reuses the accepted decoder and its exact dispositions. The
 upstream bundles are not present in this checkout; any later new protocol behavior
 must satisfy their verification gate before integration. This checkpoint makes no
-new protocol-pagination, completeness, media or identity-authority claim.
+new protocol-pagination, completeness or identity-authority claim. Rich metadata
+projection below is not real media availability, retrieval or acceptance evidence.
 
 ## Supported opt-in surface
 
@@ -71,18 +72,46 @@ be turned into success by an abort notice or by retrying an external side effect
 ## Resource budgets and remaining limitation
 
 `streamLimits.maxMessagesPerChunk` bounds observations per callback;
-`maxChunkBytes` bounds the UTF-8 JSON observation array including brackets/commas,
+`maxChunkBytes` bounds the UTF-8 JSON metadata array including brackets/commas,
+plus a conservative charge for each protected media handle in RICH_V2,
 with no silent truncation. An individually oversized projected observation rejects
 the capture. `maxParkedMessages` independently limits source records that precede
 Conversation.id; overflow rejects, never drops them. The inherited batch bytes,
 source-field count and total admitted-message budgets still apply across all chunks.
 
-The new observation emitter retains only one bounded chunk plus the current record,
-not the whole batch array. This is **not yet a constant-space source implementation**:
-private deferred message-write closures, header parts and batch-wide metadata remain
-under the inherited finite batch admission ceilings. Their retention must be eliminated
-or independently bounded/spilled in the next source slice. The consumer must not retain
-all chunks in memory. No measured peak-memory/large-data gate is claimed here.
+`streamLimits.resources` is required for RICH_V2 and optional for TEXT_V1. All six
+ceilings are explicit positive safe integers; none has a hidden default:
+
+- `maxRecordBytes`: inspected record/non-descended field ceiling, additionally capped
+  by inherited record/batch limits. A large conversation is descended incrementally.
+- `maxConversationHeaderBytes`: retained header wire bytes plus per-entry charges.
+- `maxParkedBytes`: detached records before Conversation.id plus per-entry charges;
+  independent of `maxParkedMessages`. Boundary mode does not also build a decoded
+  private-message parking collection for the same source records.
+- `maxRetainedPrivateBytes`: conservative source-unit retained payload/backing-buffer,
+  string and entry charges. It includes deferred body writes in PRESERVE mode, root
+  contact/map/name collections, trusted-contact tokens and salt. Shared backing buffers
+  may be charged more than once; this is conservative admission, not measured RSS.
+- `maxRetainedNotificationBytes`: independent worker admission ceiling for retained
+  notification backing allocations, including nested bytes, before any capture starts.
+- `maxThumbnailBytes`: admitted JPEG-signature thumbnail source bytes. Oversize or
+  unsupported thumbnails are explicitly omitted, without dropping message metadata.
+
+Every overflow rejects the capture, cannot seal and cannot advance source receipts.
+The opt-in `privateMailbox: 'DISABLED'` avoids historical message/body re-encoding,
+deferred body closures and private mailbox thread/contact/name/map caches/writes.
+It does **not** disable trusted-contact tokens, NCT salt, ephemeral chat metadata or
+other protocol-private state. Omission/PRESERVE retains the previous private archive.
+Mailbox disabling is not a business-truth fallback or an identity-evidence import.
+Small retained descriptors/header/salt bytes are detached from source allocations.
+
+The observation emitter retains one bounded chunk plus the current record, not the
+whole batch array. Remaining protocol-private source-unit collections are independently
+budgeted; overflow rejects rather than inventing a spill protocol. This is **not a
+measured constant-space/RSS guarantee**. The consumer must stage chunks durably and
+not retain them all. Per-job ceilings multiply by configured concurrency; source-unit
+private state remains finite, not persisted application checkpoints. No progressive
+large-data/peak-memory acceptance gate is claimed here.
 
 The executor uses the same JavaScript event loop, not a worker thread/process.
 Asynchronous backpressure does not wait in the incoming LIVE path; synchronous
@@ -90,15 +119,46 @@ consumer CPU work can still block the event loop and must be bounded/yielding.
 
 ## Projection scope and privacy
 
-This first slice uses the v1 TEXT/UNSUPPORTED observation projection. Duplicate source
+Omitting `streamContent` or selecting TEXT_V1 keeps the v1 TEXT/UNSUPPORTED projection.
+The opt-in RICH_V2 profile is marked on BEGIN/SEAL; it must not reinterpret older stored
+captures. Duplicate source
 occurrences and colliding stanza IDs remain distinct, with original ordinal/address
 scope. It does not fetch media, infer aliases, create receipts or introduce a source
 store/mailbox business-truth fallback. Non-DIRECT detail is still excluded. ROOT13
 CallLogRecord remains excluded; unknown families remain fail closed.
 
-Rich media/PTT, quoted/forwarded metadata, exact alias/conversation evidence and
-protected retrieval descriptors are separate next slices with synthetic fixtures and
-explicit semantic/security review. No AI, groups expansion or unread authority is added.
+RICH_V2 projects already structurally validated DIRECT records, without new schema,
+wire requests, unwrap behavior or receipt authority:
+
+| Source fact                                                                                    | Candidate projection                                                | Limits                                                                                         |
+| ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Text / extended text                                                                           | TEXT, original safe-as-text value                                   | No HTML execution or source mutation                                                           |
+| Image, video/GIF, audio, PTT, document, sticker                                                | Typed metadata, caption, dimensions/duration/flags when present     | Metadata only, no retrieval or playback proof                                                  |
+| File length                                                                                    | Exact unsigned uint64 decimal string                                | Never rounded into transfer-helper numeric length                                              |
+| Thumbnail                                                                                      | Bounded JPEG-signature bytes as base64, or explicit omission        | Signature is not decoder validity; renderer must still fail safely                             |
+| Descriptor                                                                                     | Protected separate handle                                           | Relative locator, supported crypto type, exact 32-byte key/hashes, conservative MIME allowlist |
+| Location                                                                                       | Finite ranged coordinates and optional source name/address          | No geocoding/live-location inference                                                           |
+| Contact/vCard                                                                                  | Source card display name/vCard                                      | No parsing into aliases or identity merges                                                     |
+| Forwarded / quoted                                                                             | Only explicit source flags/score and exact quote ID/address/preview | No direction inferred; unsupported quote is a hint only                                        |
+| Wrappers, view-once (including direct flag), reactions, revoked/protocol and other known kinds | UNSUPPORTED placeholder                                             | No implicit unwrap, new semantics or retrieval descriptor                                      |
+
+Conflicting direct/quoted content fields reject, rather than choose an arbitrary
+payload. Unknown/malformed protocol fields retain the accepted fail-closed gate.
+Unavailable/invalid descriptors preserve message metadata with a fixed UNAVAILABLE
+reason; DESCRIPTOR_AVAILABLE is not a CDN availability/expiry or integrity claim.
+Signed/absolute URLs are not a fallback; MIME/filename guards do not replace actual
+fetch response/size/cache validation in the later bounded media pipeline.
+
+`WaHistorySyncMediaSourceV2` holds detached descriptor bytes in a WeakMap with no
+enumerable secrets. JSON serialization throws; Node inspection is masked. A consumer
+must remove `mediaSource` from public metadata JSON, explicitly export it only into
+protected encryption-at-rest persistence, and make metadata+descriptor durable as
+one provisional capture operation. `getTransferInput()` returns sensitive detached
+copies for protected persistence/the existing transfer API. It performs no request;
+callers must separately impose actual byte/MIME/response limits. Never log that export.
+
+Exact alias/conversation evidence remains a separate next source slice. No AI, groups
+expansion, unread authority, call-log inclusion or CRM media renderer is added.
 Do not log callback payloads: they contain private message text and source addresses.
 Persist only through the protected capture path; operational outputs are fixed counts,
 status/reason tokens and opaque internal IDs. Never expose media keys/locators or auth.
@@ -113,6 +173,33 @@ proxy-dispatcher test; no proxy test PASS is claimed). Structure (54 source dire
 core/examples/bench/all workspace typechecks, CJS/ESM/types build, lint, format and
 diff checks pass. The fake-server test was also typechecked after addition.
 These are local source-candidate gates, not new CI/PR or final milestone gates.
+
+That paragraph records the first streaming checkpoint, not the newer rich slice.
+The richer follow-up adds 30 synthetic core tests and extends the encrypted local
+cross-check to TEXT_V1 and RICH_V2. Both local flows receive LIVE while a CHUNK is
+held, withhold history receipts through a held SEAL, then observe exactly one
+ordinary and one hist_sync receipt. These are synthetic source-flow observations,
+not real WhatsApp, PostgreSQL durability, replay or media-fetch evidence.
+
+Final rich-slice core run: **1,378 total, 1,377 pass, zero failures, one skip**,
+concurrency 2, flow-only names excluded. The optional proxy-dispatcher test was
+rerun independently and again skipped because undici is absent; no proxy PASS is
+claimed. Final new core + encrypted cross-check run is **32/32** (30 + 2).
+The 187-test focused regression run passed before the last two parser cases were
+added; those two are included in the final full/new-test runs. Structure remains
+54 source directories. CJS/ESM/types build, core/examples/bench/workspace typechecks,
+full lint plus last-change lint, formatting and whitespace gates pass locally.
+
+The new tests exercise each metadata kind, quoted/forwarded facts, disabled-mailbox
+protocol-private hooks, default/v1 compatibility, protected-handle serialization and
+detached buffers, relative-locator/MIME/filename/uint64/thumbnail guards, chunk handle
+charges, record/header/parked/private/notification retention rejection, reversed field
+order and actual-parser ambiguity/exclusions. An initial fixture incorrectly called
+a non-existent generated fromObject API; the fixture was corrected to encode/decode.
+Its uint64 case then exposed that the existing transfer helper rejects unsafe numeric
+length conversion. The rich projector now keeps the exact decimal separately and
+passes descriptor-only fields to that unchanged helper. No assertion was weakened,
+no transfer/protocol decision was patched and no private source data was used.
 
 The new core suite covers contiguous/empty captures, count/UTF-8 byte backpressure,
 oversize/gap rejection, cancellation and late settlement, actual parser staging and

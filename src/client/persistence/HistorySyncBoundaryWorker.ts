@@ -58,7 +58,8 @@ export class HistorySyncBoundaryWorker {
         onFailure: (
             reason: 'queue_full' | 'processing_failed' | 'timeout' | 'cancelled' | 'faulted'
         ) => void,
-        onFault: (reason: WaHistorySyncBoundaryFaultReason) => void = () => undefined
+        onFault: (reason: WaHistorySyncBoundaryFaultReason) => void = () => undefined,
+        private readonly maxRetainedNotificationBytes?: number
     ) {
         this.limits = limits
         this.process = process
@@ -96,6 +97,8 @@ export class HistorySyncBoundaryWorker {
             // before either active or queued admission. maxQueuedBytes below is
             // a separate aggregate ceiling for queued jobs only.
             retainedBytes > this.limits.maxBatchBytes ||
+            (this.maxRetainedNotificationBytes !== undefined &&
+                retainedBytes > this.maxRetainedNotificationBytes) ||
             sourceBytes > this.limits.maxBatchBytes ||
             (notification.initialHistBootstrapInlinePayload instanceof Uint8Array &&
                 notification.initialHistBootstrapInlinePayload.byteLength >

@@ -12,6 +12,7 @@ import type { WaCallGroupParticipant, WaCallType } from '@client/events/call'
 import type { IncomingPresenceType, PresenceLastSeen } from '@client/events/presence'
 import type { WaBlocklistResult } from '@client/events/privacy'
 import type { CompanionHostPersistence } from '@client/persistence/companion-host'
+import type { WaHistorySyncMediaSourceV2 } from '@client/persistence/WaHistorySyncMediaSourceV2'
 import type { WaClientPluginDefinition } from '@client/plugins/types'
 import type { WaMediaProcessor } from '@media/processor'
 import type { WaLinkPreviewOptions } from '@message/addons/link-preview/types'
@@ -375,16 +376,94 @@ export interface WaHistorySyncOptions {
     readonly onStream?: WaHistorySyncStreamHandler
     /** Required with `onStream`; no implicit chunk/parking budgets. */
     readonly streamLimits?: WaHistorySyncStreamLimits
+    /** v2-only rich projection is explicit; omission preserves the initial TEXT_V1 projection. */
+    readonly streamContent?: 'TEXT_V1' | 'RICH_V2'
+    /** v2-only optional source mailbox policy. Protocol-private state is never disabled by this. */
+    readonly privateMailbox?: 'PRESERVE' | 'DISABLED'
     /** Required with either boundary; caller-selected finite values, no library defaults. */
     readonly boundaryLimits?: WaHistorySyncBoundaryLimits
 }
 
 export interface WaHistorySyncStreamLimits {
     readonly maxMessagesPerChunk: number
-    /** UTF-8 JSON size of one normalized message-observation array, including brackets/commas. */
+    /**
+     * UTF-8 JSON metadata-array size including brackets/commas, plus conservative
+     * protected media-handle charges in RICH_V2. Not a measured RSS ceiling.
+     */
     readonly maxChunkBytes: number
     /** Records preceding Conversation.id are bounded separately, never silently dropped. */
     readonly maxParkedMessages: number
+    /** Independent working-set limits; required with RICH_V2, opt-in with TEXT_V1. No defaults. */
+    readonly resources?: WaHistorySyncResourceLimits
+}
+
+export interface WaHistorySyncResourceLimits {
+    readonly maxRecordBytes: number
+    readonly maxConversationHeaderBytes: number
+    readonly maxParkedBytes: number
+    /** Conservative retained private-payload/buffer/entry accounting, not a measured RSS limit. */
+    readonly maxRetainedPrivateBytes: number
+    /** Worker admission ceiling includes notification backing allocations, not just subarray views. */
+    readonly maxRetainedNotificationBytes: number
+    readonly maxThumbnailBytes: number
+}
+
+export interface WaHistorySyncMediaMetadataV2 {
+    readonly mimetype?: string
+    /** Exact uint64 decimal source value; never rounded to a JS number. */
+    readonly fileLength?: string
+    readonly caption?: string
+    readonly fileName?: string
+    readonly width?: number
+    readonly height?: number
+    readonly seconds?: number
+    readonly ptt?: boolean
+    readonly gifPlayback?: boolean
+    readonly isAnimated?: boolean
+    readonly thumbnailState: 'ABSENT' | 'AVAILABLE' | 'OMITTED_LIMIT' | 'UNSUPPORTED_FORMAT'
+    readonly thumbnail?: { readonly mimetype: 'image/jpeg'; readonly base64: string }
+    readonly retrievalState: 'DESCRIPTOR_AVAILABLE' | 'UNAVAILABLE'
+    readonly retrievalReason?: 'MISSING_DESCRIPTOR' | 'INVALID_DESCRIPTOR' | 'UNSAFE_MIME'
+}
+
+export type WaHistorySyncContentV2 =
+    | WaHistorySyncMessageObservation['content']
+    | {
+          readonly kind: 'IMAGE' | 'VIDEO' | 'AUDIO' | 'VOICE_NOTE' | 'DOCUMENT' | 'STICKER'
+          readonly media: WaHistorySyncMediaMetadataV2
+      }
+    | {
+          readonly kind: 'LOCATION'
+          readonly latitude: number
+          readonly longitude: number
+          readonly name?: string
+          readonly address?: string
+      }
+    | {
+          readonly kind: 'CONTACT'
+          readonly contacts: readonly { readonly displayName?: string; readonly vcard?: string }[]
+      }
+
+/** Normalized facts only. Never infer receipt, alias or quote direction from metadata. */
+export interface WaHistorySyncMessageObservationV2 extends Omit<
+    WaHistorySyncMessageObservation,
+    'content'
+> {
+    readonly content: WaHistorySyncContentV2
+    readonly context?: {
+        readonly isForwarded?: boolean
+        readonly forwardingScore?: number
+        readonly quote?: {
+            readonly externalMessageId: string
+            readonly participant?: string
+            readonly remoteJid?: string
+            readonly preview?:
+                | { readonly kind: 'TEXT'; readonly text: string }
+                | { readonly kind: 'UNSUPPORTED'; readonly kindHint?: string }
+        }
+    }
+    /** Protected locator/key/hash handle, not public JSON. Persist separately with encryption at rest. */
+    readonly mediaSource?: WaHistorySyncMediaSourceV2
 }
 
 export interface WaHistorySyncBoundaryLimits {
@@ -482,8 +561,8 @@ export interface WaHistorySyncBatchContext {
 /**
  * Delivery-scoped v2 capture. captureId is opaque, not a server cursor or replay key.
  * No complete message array is delivered at SEAL. A rejected/unsealed capture is
- * incomplete, even if source progress says 100. v1 content projection is preserved
- * in this initial streaming slice; rich projection requires its separate fixtures.
+ * incomplete, even if source progress says 100. TEXT_V1 preserves the original
+ * projection; explicit RICH_V2 projects normalized metadata and protected handles.
  * Private source fields must not be logged or exposed as diagnostics.
  */
 export type WaHistorySyncStreamEventV2 =
@@ -493,13 +572,14 @@ export type WaHistorySyncStreamEventV2 =
           readonly captureId: string
           readonly sourceHistoryCompleteness: 'UNKNOWN'
           readonly notification: WaHistorySyncBatchV1['notification']
+          readonly contentProfile?: 'RICH_V2'
       }
     | {
           readonly version: 2
           readonly type: 'CHUNK'
           readonly captureId: string
           readonly sequence: number
-          readonly messageObservations: readonly WaHistorySyncMessageObservation[]
+          readonly messageObservations: readonly WaHistorySyncMessageObservationV2[]
       }
     | {
           readonly version: 2
@@ -508,6 +588,7 @@ export type WaHistorySyncStreamEventV2 =
           readonly chunkCount: number
           readonly messageObservationCount: number
           readonly manifest: Omit<WaHistorySyncBatchV1, 'version' | 'messageObservations'>
+          readonly contentProfile?: 'RICH_V2'
       }
     | {
           readonly version: 2
